@@ -109,6 +109,20 @@ for a missing step, capability report honesty, execution history.
 | Authorization / controlled execution | Working (role matrix, irreversible approval gates, pre-run duplicate refusal) |
 | Independent result verification | Working (HTTP system-of-record contract; unreachable oracle = failed, never success) |
 
+### Working paths and applications
+
+| What | Where |
+| --- | --- |
+| Project root | `C:\Users\shiva kushwah\Desktop\enterpriseai-copilot` |
+| Demo applications | `apps/demo` — AcmeDesk CRM `http://127.0.0.1:4300`, StockDesk `http://127.0.0.1:4400` |
+| API | `apps/api` — `http://127.0.0.1:4000` (`pnpm dev`), `:4100` inside the scenario runner |
+| Extension (built) | `apps/extension/.output/chrome-mv3` |
+| Engine | `.venv-flow` (OpenAdapt 2.3.0) through `packages/workflow/python/copilot_bridge.py` |
+| Recordings / bundles / run reports | `.copilot-data/scenarios/<timestamp>/recordings/<id>` and `<id>-bundle`, `.copilot-data/scenarios/<timestamp>/runs/<executionId>/report.json` |
+| Scenario evidence | `.copilot-data/scenarios/<timestamp>/evidence.json` |
+| Extension evidence | `.copilot-data/extension-check/evidence.json`, `shots/*.png` |
+| Database | `.copilot-data/pg` (PGlite) or `DATABASE_URL` (PostgreSQL + pgvector) |
+
 ---
 
 ## 3. Fixes made in this session
@@ -148,6 +162,10 @@ for a missing step, capability report honesty, execution history.
 
 ## 4. Known limitations / blockers
 
+- **The OpenAdapt vendor test suite was not run.** The engine is verified through
+  this project's adapter (`probe`, `record-scripted`, `compile`, `replay`);
+  `research/OpenAdapt/packages/flow/tests` needs that package's `dev` extras and
+  is not part of this workspace.
 - **Stagehand is not installed.** `@browserbasehq/stagehand` is absent and no
   model key is configured, so the capability is reported `blocked` and the route
   answers 503. This is intentional (optional runtime dependency).
