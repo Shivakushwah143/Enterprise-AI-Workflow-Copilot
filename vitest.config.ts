@@ -10,6 +10,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
+    // Only this project's suites. The research/ clone ships its own tests and
+    // they are not part of this workspace.
+    include: ["tests/**/*.test.ts"],
     testTimeout: 30_000,
     hookTimeout: 60_000,
     server: { deps: { external: ["node:sqlite"] } },

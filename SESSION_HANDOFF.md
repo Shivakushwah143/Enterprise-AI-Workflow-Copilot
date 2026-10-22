@@ -1,7 +1,8 @@
 # Session handoff — Enterprise AI Workflow Copilot
 
-Updated: 2026-10-22 (continuation session). Branch `master`, last commit before
-this session: `abca67c checkpoint: phase 2 validation and phase 3 integration WIP`.
+Updated: 2026-10-22 (continuation session). Branch `main` (renamed from
+`master` mid-session), last commit before this session:
+`abca67c checkpoint: phase 2 validation and phase 3 integration WIP`.
 
 This file is a state inventory backed by command output. Anything not listed
 under **Evidence** was not verified in this environment.
@@ -81,10 +82,12 @@ Evidence: `.copilot-data/extension-check/evidence.json` plus screenshots in
 | Command | Result |
 | --- | --- |
 | `pnpm typecheck` (root + 7 packages) | PASS |
+| `pnpm test` (unit + integration) | PASS — 5 files, 44 tests |
 | `pnpm test:unit` | PASS — 4 files, 27 tests |
 | `pnpm test:integration` | PASS — 17 tests |
 | `pnpm build:extension` | PASS — chrome-mv3, 224.77 kB |
-| `python -m playwright probe` (via `OpenAdaptEngine.probe`) | PASS — `ok`, Chromium installed |
+| `pnpm dev` smoke test | PASS — demo apps on :4300/:4400, `GET /api/health` ok, `/api/capabilities` reports the engine available |
+| `OpenAdaptEngine.probe()` (via `pnpm exec tsx`) | PASS — `ok`, Chromium installed |
 
 Integration coverage worth naming: unauthenticated 401, employee cannot approve
 (403), foreign workflow is 404, approval requires `acknowledgeRisk`, plan
@@ -130,11 +133,16 @@ for a missing step, capability report honesty, execution history.
    - OpenAdapt 2.3.0 emits schema 2, where `param_specs` is a map keyed by
      parameter name. Both array (schema 1) and map (schema 2) shapes are
      accepted.
-5. Added tests, `vitest.config.ts` (externalizes `node:sqlite` for the Vite
-   version in use), `apps/api/src/seed-data.ts` (seed extracted so the scenario
-   runner seeds the same world), `scripts/dev.ts`, `scripts/run-scenarios.ts`,
-   `scripts/verify-extension.ts`, README, and the `.gitignore` entry for the
-   third-party clone and local tool state.
+5. Added tests, `vitest.config.ts`, `apps/api/src/seed-data.ts` (seed extracted
+   so the scenario runner seeds the same world), `scripts/dev.ts`,
+   `scripts/run-scenarios.ts`, `scripts/verify-extension.ts`, README, and the
+   `.gitignore` entry for the third-party clone and local tool state.
+   - `vitest.config.ts` externalizes `node:sqlite` (newer than the Vite version
+     WXT pins) and restricts `include` to `tests/**`: a bare `vitest run` was
+     collecting the OpenAdapt clone's own JS tests (39 failing files) from
+     `research/OpenAdapt`.
+6. `scripts/dev.ts` avoided top-level `await` (the root package is CommonJS, so
+   tsx rejected it).
 
 ---
 
@@ -165,7 +173,19 @@ for a missing step, capability report honesty, execution history.
 
 ---
 
-## 5. Next recommended actions
+## 5. Checkpoint
+
+- Branch `main`. Commits this session:
+  `dceb9d7 checkpoint: complete the record-to-verify lifecycle and prove it end to end`
+  (plus a follow-up for the vitest scope fix).
+- `research/OpenAdapt` had been committed as a gitlink by an earlier checkpoint
+  (`d814081`); it is removed from the index, and `research/OpenAdapt/`,
+  `.agents/`, `.freebuff/`, `.venv-flow/`, `.copilot-data/` and `node_modules/`
+  are gitignored.
+- Nothing was pushed. A remote exists (`origin`, `Shivakushwah143/Enterprise-AI-Workflow-Copilot`)
+  but pushing was not authorised or performed in this session.
+
+## 6. Next recommended actions
 
 1. Configure `LLM_PROVIDER`/`OPENAI_API_KEY` and `EMBEDDING_PROVIDER`, then
    re-run `pnpm demo:scenarios` to confirm the model planner path and vector
