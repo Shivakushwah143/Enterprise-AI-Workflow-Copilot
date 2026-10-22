@@ -445,3 +445,67 @@ export function listBrowserSessions(tenantId: string, limit = 10): BrowserSessio
 export function resetBrowserSessions(): void {
   sessions.clear();
 }
+
+/** First selector Stagehand proposed, wherever its v4 shape puts it. */
+function firstSelector(observed: unknown, depth = 0): string | null {
+  if (!observed || depth > 4) return null;
+  if (Array.isArray(observed)) {
+    for (const item of observed) {
+      const found = firstSelector(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof observed === "object") {
+    const record = observed as Record<string, unknown>;
+    const selector = record["selector"] ?? record["css"];
+    if (typeof selector === "string" && selector.trim()) return selector.trim();
+    for (const value of Object.values(record)) {
+      const found = firstSelector(value, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * Bounded locator assistance for deterministic replay (M2).
+ *
+ * Stagehand is asked to *identify* one control, never to act on it. No approval
+ * is consumed and no business write can happen here: the caller only receives a
+ * candidate selector, which `targets.ts` validates against the live page before
+ * anything is used. Returns `null` when unconfigured or when no candidate is
+ * proposed — the caller then refuses rather than guessing.
+ */
+export async function locateWithStagehand(input: {
+  url: string;
+  instruction: string;
+}): Promise<string | null> {
+  const mod = await loadStagehandModule();
+  const credentials = llmCredentials();
+  if (!mod || !credentials) return null;
+
+  const browser = await mod.localBrowser.launch({
+    headless: process.env.STAGEHAND_HEADLESS !== "false",
+  });
+  try {
+    const stagehand = await mod.Stagehand.create({
+      browser,
+      model: { modelName: credentials.modelName, apiKey: credentials.apiKey },
+    });
+    try {
+      const pages = await browser.context.pages();
+      const page = pages[0] ?? (await browser.context.newPage());
+      await page.goto(input.url);
+      if (!stagehand.observe) return null;
+      const observed = await stagehand.observe(input.instruction);
+      return firstSelector(observed);
+    } finally {
+      await stagehand.close().catch(() => undefined);
+    }
+  } catch {
+    return null;
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}

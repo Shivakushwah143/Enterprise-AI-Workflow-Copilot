@@ -15,6 +15,7 @@ import {
   ExecuteSchema,
   IntentRequestSchema,
   RegisterApplicationSchema,
+  ReviewRepairSchema,
   StartRecordingSchema,
   roleCan,
   type Capabilities,
@@ -24,6 +25,7 @@ import {
   type Permission,
   type Skill,
   type Workflow,
+  type WorkflowStep,
 } from "@copilot/shared";
 import type { ExecutionRow, SessionRow, Store } from "@copilot/knowledge";
 import type { KnowledgeEngine } from "@copilot/knowledge";
@@ -33,7 +35,9 @@ import {
   guidanceFor,
   llmStatus,
   resolveIntent,
+  type KnownTarget,
   type SkillContext,
+  type TargetResolution,
 } from "@copilot/agent";
 import { configuredEmbeddingProvider } from "@copilot/knowledge";
 import { inspectBundle, type WorkflowEngine } from "@copilot/workflow";
@@ -46,10 +50,12 @@ import {
 import {
   getBrowserSession,
   listBrowserSessions,
+  locateWithStagehand,
   runStagehandTask,
   stagehandStatus,
   startAutonomousSession,
 } from "./stagehand.js";
+import { locateInstruction, resolveTargets as resolveLiveTargets } from "./targets.js";
 
 export interface ApiDeps {
   store: Store;
@@ -91,6 +97,10 @@ function toPublicExecution(row: ExecutionRow): Execution {
     verification: row.verification,
     message: row.message,
     modelCalls: row.modelCalls,
+    failure: row.failure,
+    timings: row.timings,
+    recovery: row.recovery,
+    memory: row.memory,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt,
   };
@@ -624,6 +634,25 @@ export function createApp(deps: ApiDeps) {
       }
     }
 
+    // M2: confirm every target in the live page before acting. The AI fallback
+    // is used only when the caller asked for it and only to *locate*.
+    const resolver = (
+      steps: WorkflowStep[],
+      known: KnownTarget[],
+    ): Promise<TargetResolution[]> =>
+      resolveLiveTargets({
+        url: application.baseUrl,
+        steps,
+        known,
+        assist: body.allowAiLocator
+          ? (step) =>
+              locateWithStagehand({
+                url: application.baseUrl,
+                instruction: locateInstruction(step),
+              })
+          : undefined,
+      }).catch(() => []);
+
     const execution = await executeSkill({
       store: deps.store,
       engine: deps.engine,
@@ -636,6 +665,8 @@ export function createApp(deps: ApiDeps) {
       approved: body.approved,
       applicationUrl: application.baseUrl,
       artifactRoot: deps.artifactRoot,
+      resolveTargets: resolver,
+      memoryMode: body.memory,
       log: logger,
     });
     return c.json(toPublicExecution(execution), 201);
@@ -654,6 +685,52 @@ export function createApp(deps: ApiDeps) {
     const execution = await deps.store.getExecution(session.tenant.id, c.req.param("id"));
     if (!execution) throw new CopilotError("not_found", "Execution not found.", 404);
     return c.json(toPublicExecution(execution));
+  });
+
+  /* ---------------- recovery memory (M3) ---------------- */
+
+  app.get("/api/memory/episodes", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "execution:read");
+    const requested = Number(c.req.query("limit") ?? 20);
+    const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 100) : 20;
+    const skillId = c.req.query("skillId");
+    const items = await deps.store.listEpisodes(session.tenant.id, {
+      skillId: skillId || undefined,
+      limit,
+    });
+    return c.json({ items });
+  });
+
+  app.get("/api/repairs", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "workflow:read");
+    const status = c.req.query("status");
+    if (status && !["candidate", "approved", "rejected", "retired"].includes(status)) {
+      throw new CopilotError("invalid_request", "Unknown repair status.", 400);
+    }
+    const items = await deps.store.findRepairs(session.tenant.id, {
+      ...(status ? { status: status as "candidate" | "approved" | "rejected" | "retired" } : {}),
+      ...(c.req.query("workflowId") ? { workflowId: c.req.query("workflowId") } : {}),
+    });
+    return c.json({ items });
+  });
+
+  app.post("/api/repairs/:id/review", async (c) => {
+    const session = c.get("session");
+    // Promotion to reusable memory is an approval decision, not an execution
+    // side effect: only a role that can approve workflows may review a repair.
+    requirePermission(session, "workflow:approve");
+    const body = ReviewRepairSchema.parse(await c.req.json());
+    const repair = await deps.store.reviewRepair(
+      session.tenant.id,
+      c.req.param("id"),
+      body.status,
+      session.user.id,
+    );
+    if (!repair) throw new CopilotError("not_found", "Repair not found.", 404);
+    logger({ event: "repair.reviewed", repairId: repair.id, status: repair.status });
+    return c.json({ repair });
   });
 
   /* ---------------- knowledge ---------------- */

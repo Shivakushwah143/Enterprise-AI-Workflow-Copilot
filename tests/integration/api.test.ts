@@ -217,6 +217,8 @@ const fakeEngine: WorkflowEngine = {
       healCount: 0,
       modelCalls: 0,
       totalMs: 5,
+      stepsTotalMs: 5,
+      engineOverheadMs: 0,
       steps: BUNDLE_STEPS.map((step, index) => ({
         index,
         stepId: step.id,
@@ -228,6 +230,10 @@ const fakeEngine: WorkflowEngine = {
         identityOk: behaviour !== "crash",
         risk: step.risk,
         error: behaviour === "crash" ? "engine crashed before the write" : null,
+        durationMs: 5,
+        inputVerified: null,
+        fieldRead: null,
+        failureCategory: null,
       })),
     };
     if (behaviour === "crash") {
@@ -261,6 +267,8 @@ const fakeEngine: WorkflowEngine = {
       }),
     });
     if (!response.ok) {
+      // What a real engine report carries when the app refuses the write: a
+      // safety halt, no policy refusal record, and the app's own error text.
       return {
         ...base,
         ok: true,
@@ -268,6 +276,12 @@ const fakeEngine: WorkflowEngine = {
         executionOutcome: "HALTED",
         haltReason: `application rejected the write: HTTP ${response.status}`,
         haltIntent: "Save the customer",
+        haltObservedTexts: ["Save failed: Downstream validation rejected this customer"],
+        steps: base.steps.map((step, index) =>
+          index === base.steps.length - 1
+            ? { ...step, ok: false, safetyHalt: true, failureCategory: "safety_halt" }
+            : step,
+        ),
       };
     }
     return { ...base, ok: true, success: true, executionOutcome: "COMPLETED" };
@@ -526,6 +540,10 @@ describe("employee request -> plan -> guarded execution", () => {
     expect(response.body.outcome).toBe("VERIFIED");
     expect(response.body.verification?.passed).toBe(true);
     expect(response.body.verification?.tier).toBe("system_of_record");
+    // M4: every run records whether memory was consulted, and the answer here
+    // is "enabled, nothing applicable yet".
+    expect(response.body.memory?.mode).toBe("enabled");
+    expect(response.body.memory?.appliedRepairIds).toEqual([]);
 
     const oracle = await fetch(
       `http://127.0.0.1:${CRM_PORT}/api/customers?name=Northwind%20Freight`,
@@ -588,6 +606,13 @@ describe("employee request -> plan -> guarded execution", () => {
     });
     expect(response.body.outcome).toBe("FAILED");
     expect(response.body.verification?.passed).toBe(false);
+    // P0: a write the application rejected is an application failure, not a
+    // policy refusal and not an unexplained halt.
+    expect(response.body.failure?.origin).toBe("application");
+    expect(response.body.failure?.code).toBe("APPLICATION_REJECTED");
+    expect(response.body.failure?.evidence?.applicationEvidence?.messages).toEqual([
+      expect.stringContaining("Save failed"),
+    ]);
 
     await fetch(`http://127.0.0.1:${CRM_PORT}/api/faults`, {
       method: "POST",

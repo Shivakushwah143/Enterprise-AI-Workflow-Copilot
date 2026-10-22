@@ -202,6 +202,9 @@ CREATE TABLE IF NOT EXISTS executions (
   model_calls INTEGER NOT NULL DEFAULT 0,
   message TEXT,
   requested_by TEXT,
+  failure JSONB,
+  timings JSONB,
+  recovery JSONB,
   started_at TIMESTAMPTZ NOT NULL,
   finished_at TIMESTAMPTZ
 );
@@ -216,7 +219,10 @@ CREATE TABLE IF NOT EXISTS execution_steps (
   status TEXT NOT NULL,
   rung TEXT,
   detail TEXT,
-  duration_ms INTEGER
+  duration_ms INTEGER,
+  input_verified BOOLEAN,
+  resolved_selector TEXT,
+  resolution_source TEXT
 );
 
 CREATE TABLE IF NOT EXISTS verification_results (
@@ -232,9 +238,57 @@ CREATE TABLE IF NOT EXISTS verification_results (
   created_at TIMESTAMPTZ NOT NULL
 );
 
+-- Episodic memory: one row per execution, so a later run can see what
+-- happened before without replaying the engine report.
+CREATE TABLE IF NOT EXISTS execution_memory (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  execution_id TEXT NOT NULL,
+  skill_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  application_id TEXT NOT NULL,
+  intent TEXT NOT NULL,
+  outcome TEXT,
+  failure JSONB,
+  recovery JSONB,
+  trace_ref TEXT,
+  context JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+-- Procedural memory: repairs that worked, with the conditions they applied to.
+-- `candidate` is evidence awaiting review; only `approved` rows are reused.
+CREATE TABLE IF NOT EXISTS repairs (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  application_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  skill_id TEXT NOT NULL,
+  workflow_version INTEGER NOT NULL,
+  failure_origin TEXT NOT NULL,
+  failure_code TEXT NOT NULL,
+  action JSONB NOT NULL,
+  conditions JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT NOT NULL DEFAULT 'candidate',
+  success_count INTEGER NOT NULL DEFAULT 0,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT,
+  reviewed_by TEXT,
+  created_at TIMESTAMPTZ NOT NULL,
+  reviewed_at TIMESTAMPTZ,
+  last_used_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_tenant ON execution_memory(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repairs_lookup ON repairs(tenant_id, workflow_id, status);
 CREATE INDEX IF NOT EXISTS idx_skills_tenant ON skills(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_workflows_tenant ON workflows(tenant_id, application_id);
 CREATE INDEX IF NOT EXISTS idx_steps_workflow ON workflow_steps(workflow_id, idx);
 CREATE INDEX IF NOT EXISTS idx_plans_tenant ON plans(tenant_id, created_at DESC);
+-- Added with M4: the memory-use audit for a run. `ADD COLUMN IF NOT EXISTS`
+-- keeps existing databases working without a migration step.
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS memory JSONB;
+ALTER TABLE execution_steps ADD COLUMN IF NOT EXISTS repair_id TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_executions_tenant ON executions(tenant_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON doc_chunks(tenant_id, document_id);

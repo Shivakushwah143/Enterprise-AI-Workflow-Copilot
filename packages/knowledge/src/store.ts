@@ -10,12 +10,21 @@
 import { randomUUID } from "node:crypto";
 import type {
   Application,
+  Episode,
   ExecutionOutcome,
+  ExecutionTimings,
   Plan,
   ExecutionStepResult,
+  FailureOrigin,
+  FailureResult,
+  MemoryAudit,
   ParamSpec,
   RecordingMode,
   RecordingStatus,
+  RecoverySummary,
+  Repair,
+  RepairAction,
+  RepairStatus,
   Role,
   Skill,
   VerificationContract,
@@ -128,6 +137,11 @@ export interface ExecutionRow {
   message: string | null;
   modelCalls: number;
   requestedBy: string | null;
+  failure: FailureResult | null;
+  timings: ExecutionTimings | null;
+  recovery: RecoverySummary | null;
+  /** Which stored repairs were considered and whether one was used (M4). */
+  memory: MemoryAudit | null;
   startedAt: string;
   finishedAt: string | null;
 }
@@ -146,6 +160,72 @@ const now = (): string => new Date().toISOString();
 function asStringArray(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((v) => String(v));
   return [];
+}
+
+/**
+ * JSONB arrives as an object on both backends, but a driver is free to hand
+ * back the text it received. Parse defensively rather than trusting a shape.
+ */
+function asJson<T>(value: unknown): T | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return null;
+    }
+  }
+  return value as T;
+}
+
+function mapEpisode(row: Record<string, unknown>): Episode {
+  return {
+    id: String(row["id"]),
+    tenantId: String(row["tenant_id"]),
+    executionId: String(row["execution_id"]),
+    skillId: String(row["skill_id"]),
+    workflowId: String(row["workflow_id"]),
+    applicationId: String(row["application_id"]),
+    intent: String(row["intent"]),
+    outcome: (row["outcome"] as ExecutionOutcome | null) ?? null,
+    failure: asJson<FailureResult>(row["failure"]),
+    recovery: asJson<RecoverySummary>(row["recovery"]),
+    traceRef: (row["trace_ref"] as string | null) ?? null,
+    context: asJson<Record<string, unknown>>(row["context"]) ?? {},
+    createdAt: new Date(String(row["created_at"])).toISOString(),
+  };
+}
+
+function mapRepair(row: Record<string, unknown>): Repair {
+  return {
+    id: String(row["id"]),
+    tenantId: String(row["tenant_id"]),
+    applicationId: String(row["application_id"]),
+    workflowId: String(row["workflow_id"]),
+    skillId: String(row["skill_id"]),
+    workflowVersion: Number(row["workflow_version"]),
+    failureOrigin: String(row["failure_origin"]) as FailureOrigin,
+    failureCode: String(row["failure_code"]),
+    action: asJson<RepairAction>(row["action"]) ?? {
+      kind: "selector_override",
+      stepIndex: 0,
+      fromSelector: null,
+      toSelector: "",
+    },
+    conditions: asJson<Record<string, unknown>>(row["conditions"]) ?? {},
+    status: String(row["status"]) as RepairStatus,
+    successCount: Number(row["success_count"]),
+    failureCount: Number(row["failure_count"]),
+    createdBy: (row["created_by"] as string | null) ?? null,
+    reviewedBy: (row["reviewed_by"] as string | null) ?? null,
+    createdAt: new Date(String(row["created_at"])).toISOString(),
+    reviewedAt: row["reviewed_at"]
+      ? new Date(String(row["reviewed_at"])).toISOString()
+      : null,
+    lastUsedAt: row["last_used_at"]
+      ? new Date(String(row["last_used_at"])).toISOString()
+      : null,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1093,6 +1173,10 @@ export class Store {
       message: null,
       modelCalls: 0,
       requestedBy: input.requestedBy,
+      failure: null,
+      timings: null,
+      recovery: null,
+      memory: null,
       startedAt: now(),
       finishedAt: null,
     };
@@ -1128,6 +1212,10 @@ export class Store {
         | "message"
         | "modelCalls"
         | "finishedAt"
+        | "failure"
+        | "timings"
+        | "recovery"
+        | "memory"
       >
     >,
   ): Promise<void> {
@@ -1139,7 +1227,11 @@ export class Store {
          engine_report_path = COALESCE($6, engine_report_path),
          message = COALESCE($7, message),
          model_calls = COALESCE($8, model_calls),
-         finished_at = COALESCE($9, finished_at)
+         finished_at = COALESCE($9, finished_at),
+         failure = COALESCE($10::jsonb, failure),
+         timings = COALESCE($11::jsonb, timings),
+         recovery = COALESCE($12::jsonb, recovery),
+         memory = COALESCE($13::jsonb, memory)
        WHERE tenant_id = $1 AND id = $2`,
       [
         tenantId,
@@ -1151,6 +1243,10 @@ export class Store {
         patch.message ?? null,
         patch.modelCalls ?? null,
         patch.finishedAt ?? null,
+        patch.failure ? JSON.stringify(patch.failure) : null,
+        patch.timings ? JSON.stringify(patch.timings) : null,
+        patch.recovery ? JSON.stringify(patch.recovery) : null,
+        patch.memory ? JSON.stringify(patch.memory) : null,
       ],
     );
   }
@@ -1166,8 +1262,10 @@ export class Store {
     );
     for (const step of steps) {
       await this.sql.query(
-        `INSERT INTO execution_steps (id, tenant_id, execution_id, idx, step_id, intent, status, rung, detail, duration_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        `INSERT INTO execution_steps
+           (id, tenant_id, execution_id, idx, step_id, intent, status, rung, detail, duration_ms,
+            input_verified, resolved_selector, resolution_source, repair_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
         [
           randomUUID(),
           tenantId,
@@ -1179,6 +1277,10 @@ export class Store {
           step.rung,
           step.detail,
           step.durationMs,
+          step.inputVerified,
+          step.resolvedSelector,
+          step.resolutionSource,
+          step.repairId ?? null,
         ],
       );
     }
@@ -1242,7 +1344,19 @@ export class Store {
         status: String(s["status"]) as ExecutionStepResult["status"],
         rung: (s["rung"] as string | null) ?? null,
         detail: (s["detail"] as string | null) ?? null,
-        durationMs: s["duration_ms"] === null ? null : Number(s["duration_ms"]),
+        durationMs:
+          s["duration_ms"] === null || s["duration_ms"] === undefined
+            ? null
+            : Number(s["duration_ms"]),
+        inputVerified:
+          s["input_verified"] === null || s["input_verified"] === undefined
+            ? null
+            : Boolean(s["input_verified"]),
+        resolvedSelector: (s["resolved_selector"] as string | null) ?? null,
+        resolutionSource: (String(
+          s["resolution_source"] ?? "none",
+        ) as ExecutionStepResult["resolutionSource"]),
+        repairId: (s["repair_id"] as string | null) ?? null,
       })),
       verification: verify
         ? {
@@ -1258,6 +1372,10 @@ export class Store {
       message: (row["message"] as string | null) ?? null,
       modelCalls: Number(row["model_calls"]),
       requestedBy: (row["requested_by"] as string | null) ?? null,
+      failure: asJson<FailureResult>(row["failure"]),
+      timings: asJson<ExecutionTimings>(row["timings"]),
+      recovery: asJson<RecoverySummary>(row["recovery"]),
+      memory: asJson<MemoryAudit>(row["memory"]),
       startedAt: new Date(String(row["started_at"])).toISOString(),
       finishedAt: row["finished_at"]
         ? new Date(String(row["finished_at"])).toISOString()
@@ -1285,5 +1403,222 @@ export class Store {
       [tenantId, skillId],
     );
     return Number(rows[0]?.count ?? 0);
+  }
+
+  /* ---------------- episodic memory ---------------- */
+
+  /** One row per execution: outcome, failure, recovery attempt and trace ref. */
+  async addEpisode(
+    tenantId: string,
+    input: {
+      executionId: string;
+      skillId: string;
+      workflowId: string;
+      applicationId: string;
+      intent: string;
+      outcome: ExecutionOutcome | null;
+      failure: FailureResult | null;
+      recovery: RecoverySummary | null;
+      traceRef: string | null;
+      context: Record<string, unknown>;
+    },
+  ): Promise<string> {
+    const id = randomUUID();
+    await this.sql.query(
+      `INSERT INTO execution_memory
+         (id, tenant_id, execution_id, skill_id, workflow_id, application_id, intent, outcome,
+          failure, recovery, trace_ref, context, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,$12::jsonb,$13)`,
+      [
+        id,
+        tenantId,
+        input.executionId,
+        input.skillId,
+        input.workflowId,
+        input.applicationId,
+        input.intent,
+        input.outcome,
+        input.failure ? JSON.stringify(input.failure) : null,
+        input.recovery ? JSON.stringify(input.recovery) : null,
+        input.traceRef,
+        JSON.stringify(input.context),
+        now(),
+      ],
+    );
+    return id;
+  }
+
+  async listEpisodes(
+    tenantId: string,
+    options: { skillId?: string; executionId?: string; limit?: number } = {},
+  ): Promise<Episode[]> {
+    const params: unknown[] = [tenantId];
+    let where = "tenant_id = $1";
+    if (options.skillId) {
+      params.push(options.skillId);
+      where += ` AND skill_id = $${params.length}`;
+    }
+    if (options.executionId) {
+      params.push(options.executionId);
+      where += ` AND execution_id = $${params.length}`;
+    }
+    params.push(options.limit ?? 50);
+    const rows = await this.sql.query<Record<string, unknown>>(
+      `SELECT * FROM execution_memory WHERE ${where} ORDER BY created_at DESC LIMIT $${params.length}`,
+      params,
+    );
+    return rows.map(mapEpisode);
+  }
+
+  /* ---------------- procedural memory (repairs) ---------------- */
+
+  /**
+   * Store a verified repair. Idempotent for the same workflow, step, selector
+   * and failure code: a repeated recovery must not accumulate duplicate rows.
+   */
+  async createRepair(
+    tenantId: string,
+    input: {
+      applicationId: string;
+      workflowId: string;
+      skillId: string;
+      workflowVersion: number;
+      failureOrigin: FailureOrigin;
+      failureCode: string;
+      action: RepairAction;
+      conditions?: Record<string, unknown>;
+      createdBy?: string | null;
+    },
+  ): Promise<Repair> {
+    const existing = await this.findRepairs(tenantId, {
+      workflowId: input.workflowId,
+      failureCode: input.failureCode,
+    });
+    const same = existing.find(
+      (repair) =>
+        repair.action.stepIndex === input.action.stepIndex &&
+        repair.action.toSelector === input.action.toSelector &&
+        repair.action.fromSelector === input.action.fromSelector,
+    );
+    if (same) return same;
+
+    const id = randomUUID();
+    const createdAt = now();
+    const conditions = input.conditions ?? {};
+    await this.sql.query(
+      `INSERT INTO repairs
+         (id, tenant_id, application_id, workflow_id, skill_id, workflow_version,
+          failure_origin, failure_code, action, conditions, status,
+          success_count, failure_count, created_by, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,'candidate',0,0,$11,$12)`,
+      [
+        id,
+        tenantId,
+        input.applicationId,
+        input.workflowId,
+        input.skillId,
+        input.workflowVersion,
+        input.failureOrigin,
+        input.failureCode,
+        JSON.stringify(input.action),
+        JSON.stringify(conditions),
+        input.createdBy ?? null,
+        createdAt,
+      ],
+    );
+    return {
+      id,
+      tenantId,
+      applicationId: input.applicationId,
+      workflowId: input.workflowId,
+      skillId: input.skillId,
+      workflowVersion: input.workflowVersion,
+      failureOrigin: input.failureOrigin,
+      failureCode: input.failureCode,
+      action: input.action,
+      conditions,
+      status: "candidate",
+      successCount: 0,
+      failureCount: 0,
+      createdBy: input.createdBy ?? null,
+      reviewedBy: null,
+      createdAt,
+      reviewedAt: null,
+      lastUsedAt: null,
+    };
+  }
+
+  async findRepairs(
+    tenantId: string,
+    filter: {
+      applicationId?: string;
+      workflowId?: string;
+      failureOrigin?: FailureOrigin;
+      failureCode?: string;
+      stepIndex?: number;
+      status?: RepairStatus;
+    } = {},
+  ): Promise<Repair[]> {
+    const params: unknown[] = [tenantId];
+    const clauses = ["tenant_id = $1"];
+    const add = (sql: string, value: unknown): void => {
+      params.push(value);
+      clauses.push(sql.replace("?", `$${params.length}`));
+    };
+    if (filter.applicationId) add("application_id = ?", filter.applicationId);
+    if (filter.workflowId) add("workflow_id = ?", filter.workflowId);
+    if (filter.failureOrigin) add("failure_origin = ?", filter.failureOrigin);
+    if (filter.failureCode) add("failure_code = ?", filter.failureCode);
+    if (filter.status) add("status = ?", filter.status);
+    if (filter.stepIndex !== undefined) {
+      add("(action->>'stepIndex')::int = ?", filter.stepIndex);
+    }
+    const rows = await this.sql.query<Record<string, unknown>>(
+      `SELECT * FROM repairs WHERE ${clauses.join(" AND ")}
+        ORDER BY success_count DESC, created_at ASC`,
+      params,
+    );
+    return rows.map(mapRepair);
+  }
+
+  async getRepair(tenantId: string, repairId: string): Promise<Repair | null> {
+    const rows = await this.sql.query<Record<string, unknown>>(
+      "SELECT * FROM repairs WHERE tenant_id = $1 AND id = $2",
+      [tenantId, repairId],
+    );
+    const row = rows[0];
+    return row ? mapRepair(row) : null;
+  }
+
+  /** Count a reuse attempt. A failure here is evidence against the repair. */
+  async recordRepairUse(
+    tenantId: string,
+    repairId: string,
+    ok: boolean,
+  ): Promise<Repair | null> {
+    await this.sql.query(
+      `UPDATE repairs SET
+         success_count = success_count + CASE WHEN $3 THEN 1 ELSE 0 END,
+         failure_count = failure_count + CASE WHEN $3 THEN 0 ELSE 1 END,
+         last_used_at = NOW()
+       WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, repairId, ok],
+    );
+    return this.getRepair(tenantId, repairId);
+  }
+
+  /** Promotion happens here and only here: review is an explicit act. */
+  async reviewRepair(
+    tenantId: string,
+    repairId: string,
+    status: "approved" | "rejected" | "retired",
+    reviewedBy: string,
+  ): Promise<Repair | null> {
+    await this.sql.query(
+      `UPDATE repairs SET status = $3, reviewed_by = $4, reviewed_at = NOW()
+        WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, repairId, status, reviewedBy],
+    );
+    return this.getRepair(tenantId, repairId);
   }
 }

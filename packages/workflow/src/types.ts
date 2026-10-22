@@ -42,6 +42,20 @@ export interface EngineStepResult {
   identityOk: boolean | null;
   risk: string | null;
   error: string | null;
+  /** Engine-measured step time, when the report carries it. */
+  durationMs: number | null;
+  /** Engine's own check that a typed value landed in the field. */
+  inputVerified: boolean | null;
+  /** Value the engine read back from the field, when it reports one. */
+  fieldRead: string | null;
+  /** Engine's structured failure category for this step, if any. */
+  failureCategory: string | null;
+  /** The engine stopped this step for safety rather than clocking a failure. */
+  safetyHalt?: boolean | undefined;
+  /** The engine's own evidence for that refusal, when it recorded any. */
+  safetyRefusalEvidence?: unknown;
+  /** Engine's own effect check, when the step was expected to have an effect. */
+  effectVerified?: boolean | null | undefined;
 }
 
 export interface EngineReplayResult {
@@ -53,10 +67,20 @@ export interface EngineReplayResult {
   transactionOutcome: string | null;
   haltReason: string | null;
   haltIntent: string | null;
+  /**
+   * Text the application displayed when the run stopped. Application-level
+   * evidence only (never a response body), used to tell "the app rejected this"
+   * apart from "policy refused this".
+   */
+  haltObservedTexts?: string[] | undefined;
   rungCounts: Record<string, number>;
   healCount: number;
   modelCalls: number;
   totalMs: number;
+  /** Sum of the engine's own per-step times. */
+  stepsTotalMs: number;
+  /** total_ms minus the step times: launch, teardown, engine bookkeeping. */
+  engineOverheadMs: number;
   steps: EngineStepResult[];
   error?: string;
 }

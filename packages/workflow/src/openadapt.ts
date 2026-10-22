@@ -271,6 +271,13 @@ export class OpenAdaptEngine implements WorkflowEngine {
           identityOk: (r["identity_ok"] as boolean | null) ?? null,
           risk: (r["risk"] as string | null) ?? null,
           error: (r["error"] as string | null) ?? null,
+          durationMs: (r["duration_ms"] as number | null) ?? null,
+          inputVerified: (r["input_verified"] as boolean | null) ?? null,
+          fieldRead: (r["field_read"] as string | null) ?? null,
+          failureCategory: (r["failure_category"] as string | null) ?? null,
+          safetyHalt: Boolean(r["safety_halt"]),
+          safetyRefusalEvidence: r["safety_refusal_evidence"] ?? null,
+          effectVerified: (r["effect_verified"] as boolean | null) ?? null,
         }))
       : [];
 
@@ -282,10 +289,15 @@ export class OpenAdaptEngine implements WorkflowEngine {
       transactionOutcome: (payload["transaction_outcome"] as string | null) ?? null,
       haltReason: (payload["halt_reason"] as string | null) ?? null,
       haltIntent: (payload["halt_intent"] as string | null) ?? null,
+      haltObservedTexts: Array.isArray(payload["halt_observed_texts"])
+        ? (payload["halt_observed_texts"] as unknown[]).map((text) => String(text))
+        : [],
       rungCounts: (payload["rung_counts"] as Record<string, number>) ?? {},
       healCount: Number(payload["heal_count"] ?? 0),
       modelCalls: Number(payload["model_calls"] ?? 0),
       totalMs: Number(payload["total_ms"] ?? 0),
+      stepsTotalMs: Number(payload["steps_total_ms"] ?? 0),
+      engineOverheadMs: Number(payload["engine_overhead_ms"] ?? 0),
       steps,
       error: payload["ok"]
         ? undefined

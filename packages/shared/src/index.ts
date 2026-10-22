@@ -351,7 +351,172 @@ export const ExecuteSchema = z.object({
   inputs: z.record(z.string()).default({}),
   /** Explicit human approval for consequential writes. */
   approved: z.boolean().default(false),
+  /**
+   * Bounded AI assistance for target re-discovery when deterministic
+   * resolution fails. Off by default: the caller authorizes it per execution,
+   * and it is only used for locating an element, never for deciding policy.
+   */
+  allowAiLocator: z.boolean().default(false),
+  /**
+   * Whether reviewed procedural memory may be used for this execution.
+   * `disabled` is a hard switch: no repair is read, so a comparison run cannot
+   * benefit from anything the agent has already learned.
+   */
+  memory: z.enum(["enabled", "disabled"]).default("enabled"),
 });
+export type ExecuteRequest = z.infer<typeof ExecuteSchema>;
+
+/* ------------------------------------------------------------------ */
+/* Memory use audit                                                    */
+/* ------------------------------------------------------------------ */
+
+export const MemoryModeSchema = z.enum(["enabled", "disabled"]);
+export type MemoryMode = z.infer<typeof MemoryModeSchema>;
+
+/** One stored repair considered for this run, with the decision taken. */
+export const MemoryUseSchema = z.object({
+  repairId: z.string(),
+  stepIndex: z.number().int().nullable(),
+  /** `false` when any applicability condition did not hold. */
+  applicable: z.boolean(),
+  reason: z.string(),
+  /** `true` only when the repair actually determined what was executed. */
+  applied: z.boolean(),
+});
+export type MemoryUse = z.infer<typeof MemoryUseSchema>;
+
+export const MemoryAuditSchema = z.object({
+  mode: MemoryModeSchema,
+  /** Repairs the store returned for this workflow, and what was decided. */
+  retrieved: z.array(MemoryUseSchema).default([]),
+  /** Repairs that determined what was executed. */
+  appliedRepairIds: z.array(z.string()).default([]),
+  /** Repairs that agreed with a fresh re-discovery (validated, not decisive). */
+  confirmedRepairIds: z.array(z.string()).default([]),
+});
+export type MemoryAudit = z.infer<typeof MemoryAuditSchema>;
+
+/* ------------------------------------------------------------------ */
+/* Failure diagnostics, timing, recovery, memory                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where a failure originated. This is the machine-readable answer to "whose
+ * fault was it?", decided from evidence — never from the outcome alone.
+ */
+export const FailureOriginSchema = z.enum([
+  "reasoning",
+  "selector",
+  "timing",
+  "browser_session",
+  "application",
+  "input_verification",
+  "verification",
+  "infrastructure",
+  "policy",
+  "unknown",
+]);
+export type FailureOrigin = z.infer<typeof FailureOriginSchema>;
+
+export const FailureResultSchema = z.object({
+  origin: FailureOriginSchema,
+  /** Stable machine code, e.g. CONTROL_NOT_RESOLVED, ORACLE_RECORD_ABSENT. */
+  code: z.string(),
+  detectedBy: z.enum(["engine", "oracle", "policy", "api", "copilot"]),
+  detail: z.string(),
+  stepIndex: z.number().int().nullable().default(null),
+  /** Safe raw evidence: statuses, selectors, rungs, halt text. Never secrets. */
+  evidence: z.record(z.unknown()).default({}),
+});
+export type FailureResult = z.infer<typeof FailureResultSchema>;
+
+export const ExecutionPhaseTimingsSchema = z.object({
+  /** Process start until the bridge returned (engine work included). */
+  bridgeStartupMs: z.number().nullable().default(null),
+  /** Engine-reported replay time. */
+  replayMs: z.number().nullable().default(null),
+  /** Engine total minus the sum of its own step times (launch/shutdown). */
+  engineOverheadMs: z.number().nullable().default(null),
+  /** Both oracle reads together. */
+  verificationMs: z.number().nullable().default(null),
+  /** Writing steps, verification and the final execution row. */
+  persistenceMs: z.number().nullable().default(null),
+});
+export type ExecutionPhaseTimings = z.infer<typeof ExecutionPhaseTimingsSchema>;
+
+export const ExecutionTimingsSchema = z.object({
+  totalMs: z.number().int(),
+  phases: ExecutionPhaseTimingsSchema,
+  engineReportedMs: z.number().nullable().default(null),
+});
+export type ExecutionTimings = z.infer<typeof ExecutionTimingsSchema>;
+
+export const RecoveryAttemptSchema = z.object({
+  source: z.enum(["repair_memory", "rediscovery"]),
+  repairId: z.string().nullable().default(null),
+  stepIndex: z.number().int().nullable().default(null),
+  fromSelector: z.string().nullable().default(null),
+  toSelector: z.string().nullable().default(null),
+  outcome: z.enum(["recovered", "not_recovered", "refused"]),
+  detail: z.string(),
+  verifyPassed: z.boolean(),
+});
+export type RecoveryAttempt = z.infer<typeof RecoveryAttemptSchema>;
+
+export const RecoverySummarySchema = z.object({
+  attempted: z.boolean(),
+  reason: z.string(),
+  attempts: z.array(RecoveryAttemptSchema).default([]),
+});
+export type RecoverySummary = z.infer<typeof RecoverySummarySchema>;
+
+export const RepairStatusSchema = z.enum([
+  "candidate",
+  "approved",
+  "rejected",
+  "retired",
+]);
+export type RepairStatus = z.infer<typeof RepairStatusSchema>;
+
+export const RepairActionSchema = z.object({
+  kind: z.literal("selector_override"),
+  stepIndex: z.number().int(),
+  fromSelector: z.string().nullable(),
+  toSelector: z.string().min(1),
+});
+export type RepairAction = z.infer<typeof RepairActionSchema>;
+
+/**
+ * A verified repair. Reused only when `approved`: an automatic success is
+ * evidence for review, not permission to act unattended next time.
+ */
+export const RepairSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  applicationId: z.string(),
+  workflowId: z.string(),
+  skillId: z.string(),
+  workflowVersion: z.number().int(),
+  failureOrigin: FailureOriginSchema,
+  failureCode: z.string(),
+  action: RepairActionSchema,
+  conditions: z.record(z.unknown()).default({}),
+  status: RepairStatusSchema,
+  successCount: z.number().int(),
+  failureCount: z.number().int(),
+  createdBy: z.string().nullable(),
+  reviewedBy: z.string().nullable(),
+  createdAt: z.string(),
+  reviewedAt: z.string().nullable(),
+  lastUsedAt: z.string().nullable(),
+});
+export type Repair = z.infer<typeof RepairSchema>;
+
+export const ReviewRepairSchema = z.object({
+  status: z.enum(["approved", "rejected", "retired"]),
+  note: z.string().max(500).optional(),
+});
+export type ReviewRepairRequest = z.infer<typeof ReviewRepairSchema>;
 
 export const ExecutionOutcomeSchema = z.enum([
   "VERIFIED",
@@ -371,6 +536,15 @@ export const ExecutionStepResultSchema = z.object({
   rung: z.string().nullable(),
   detail: z.string().nullable(),
   durationMs: z.number().nullable(),
+  /** Engine's own check that the typed value landed in the field. */
+  inputVerified: z.boolean().nullable().default(null),
+  /** Selector actually used, which may differ from the recorded one. */
+  resolvedSelector: z.string().nullable().default(null),
+  resolutionSource: z
+    .enum(["recorded", "rediscovered", "ai_assisted", "repair", "none"])
+    .default("none"),
+  /** The reviewed repair that supplied the selector, when one did. */
+  repairId: z.string().nullable().default(null),
 });
 export type ExecutionStepResult = z.infer<typeof ExecutionStepResultSchema>;
 
@@ -401,10 +575,34 @@ export const ExecutionSchema = z.object({
   verification: VerificationResultSchema.nullable(),
   message: z.string().nullable(),
   modelCalls: z.number().int(),
+  failure: FailureResultSchema.nullable().default(null),
+  timings: ExecutionTimingsSchema.nullable().default(null),
+  recovery: RecoverySummarySchema.nullable().default(null),
+  /** Which repairs were considered, and whether any of them was used. */
+  memory: MemoryAuditSchema.nullable().default(null),
   startedAt: z.string(),
   finishedAt: z.string().nullable(),
 });
 export type Execution = z.infer<typeof ExecutionSchema>;
+
+/** One attempt, with what failed and what (if anything) repaired it. */
+export const EpisodeSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  executionId: z.string(),
+  skillId: z.string(),
+  workflowId: z.string(),
+  applicationId: z.string(),
+  intent: z.string(),
+  outcome: ExecutionOutcomeSchema.nullable(),
+  failure: FailureResultSchema.nullable(),
+  recovery: RecoverySummarySchema.nullable(),
+  /** Engine report path; the trace reference for this episode. */
+  traceRef: z.string().nullable(),
+  context: z.record(z.unknown()).default({}),
+  createdAt: z.string(),
+});
+export type Episode = z.infer<typeof EpisodeSchema>;
 
 /* ------------------------------------------------------------------ */
 /* UI guidance (Driver.js)                                             */

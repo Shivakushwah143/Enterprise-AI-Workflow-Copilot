@@ -21,9 +21,23 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *
  * `reject-create` refuses the write; `missing-control` serves the same page
  * with the save control removed, which is what "the UI changed and the button
- * is gone" looks like to a replay.
+ * is gone" looks like to a replay. `renamed-selector` keeps the page and the
+ * control's label identical and changes only the save button's id, which is the
+ * smallest UI change a locator ladder can legitimately recover from.
+ * `relabeled-selector` is the next change a real application ships: the same
+ * control with a new id *and* new wording (`Commit changes`), which no DOM-text
+ * heuristic can re-identify.
+ * `css-label-selector` is a design-system restyle: the control keeps the id it
+ * was given in the previous release but its label now comes from CSS, so the
+ * DOM carries no text while the screen looks exactly the same.
  */
-export type FaultMode = "none" | "reject-create" | "missing-control";
+export type FaultMode =
+  | "none"
+  | "reject-create"
+  | "missing-control"
+  | "renamed-selector"
+  | "relabeled-selector"
+  | "css-label-selector";
 
 const ACME_SAVE_BUTTON =
   '<button id="save-customer" class="primary" type="submit">Save customer</button>';
@@ -32,6 +46,37 @@ const STOCK_SAVE_BUTTON =
 
 function withMissingControl(page: string, button: string, replacement: string): string {
   return page.replace(button, replacement);
+}
+
+/**
+ * The same page with only the save control's id changed. Every other byte -
+ * label text, field ids, classes - is untouched, so a replay only has to
+ * re-identify one element.
+ */
+/**
+ * The same pixels, no DOM text: the label is rendered by CSS on a control that
+ * kept the id from the previous release. A locator ladder that reads text,
+ * role names or labels has nothing to match; the screen is unchanged.
+ */
+function withCssLabel(page: string, button: string, id: string): string {
+  return page
+    .replace(
+      button,
+      `<button id="${id}" class="primary css-label" type="submit"></button>`,
+    )
+    .replace(
+      "</style>",
+      "  .css-label::after { content: 'Save customer'; }\n</style>",
+    );
+}
+
+function withRenamedSaveControl(
+  page: string,
+  button: string,
+  fromId: string,
+  toId: string,
+): string {
+  return page.replace(button, button.replace(`id="${fromId}"`, `id="${toId}"`));
 }
 
 export interface AppHandle {
@@ -194,6 +239,9 @@ export async function startAcmeDesk(options: {
       | undefined;
     if (row?.mode === "reject-create") return "reject-create";
     if (row?.mode === "missing-control") return "missing-control";
+    if (row?.mode === "renamed-selector") return "renamed-selector";
+    if (row?.mode === "relabeled-selector") return "relabeled-selector";
+    if (row?.mode === "css-label-selector") return "css-label-selector";
     return "none";
   };
 
@@ -203,13 +251,38 @@ export async function startAcmeDesk(options: {
 
     try {
       if (route === "GET /") {
-        if (getFault() === "missing-control") {
+        const fault = getFault();
+        if (fault === "missing-control") {
           return html(
             res,
             withMissingControl(
               ACME_HTML,
               ACME_SAVE_BUTTON,
               '<p id="save-unavailable">Saving is temporarily unavailable.</p>',
+            ),
+          );
+        }
+        if (fault === "renamed-selector") {
+          return html(
+            res,
+            withRenamedSaveControl(
+              ACME_HTML,
+              ACME_SAVE_BUTTON,
+              "save-customer",
+              "save-customer-v2",
+            ),
+          );
+        }
+        if (fault === "css-label-selector") {
+          return html(res, withCssLabel(ACME_HTML, ACME_SAVE_BUTTON, "save-customer-v2"));
+        }
+        if (fault === "relabeled-selector") {
+          return html(
+            res,
+            withMissingControl(
+              ACME_HTML,
+              ACME_SAVE_BUTTON,
+              '<button id="save-customer-v2" class="primary" type="submit">Commit changes</button>',
             ),
           );
         }
@@ -290,7 +363,13 @@ export async function startAcmeDesk(options: {
             ? "reject-create"
             : body["mode"] === "missing-control"
               ? "missing-control"
-              : "none";
+              : body["mode"] === "renamed-selector"
+                ? "renamed-selector"
+                : body["mode"] === "relabeled-selector"
+                  ? "relabeled-selector"
+                  : body["mode"] === "css-label-selector"
+                    ? "css-label-selector"
+                    : "none";
         db.prepare("UPDATE faults SET mode = ? WHERE id = 1").run(mode);
         return json(res, 200, { mode });
       }
@@ -433,6 +512,9 @@ export async function startStockDesk(options: {
       | undefined;
     if (row?.mode === "reject-create") return "reject-create";
     if (row?.mode === "missing-control") return "missing-control";
+    if (row?.mode === "renamed-selector") return "renamed-selector";
+    if (row?.mode === "relabeled-selector") return "relabeled-selector";
+    if (row?.mode === "css-label-selector") return "css-label-selector";
     return "none";
   };
 
@@ -441,13 +523,30 @@ export async function startStockDesk(options: {
     const route = `${req.method} ${url.pathname}`;
     try {
       if (route === "GET /") {
-        if (getFault() === "missing-control") {
+        const fault = getFault();
+        if (fault === "missing-control") {
           return html(
             res,
             withMissingControl(
               STOCK_HTML,
               STOCK_SAVE_BUTTON,
               '<p id="save-unavailable">Registration is temporarily unavailable.</p>',
+            ),
+          );
+        }
+        if (fault === "renamed-selector") {
+          return html(
+            res,
+            withRenamedSaveControl(STOCK_HTML, STOCK_SAVE_BUTTON, "save-item", "save-item-v2"),
+          );
+        }
+        if (fault === "relabeled-selector") {
+          return html(
+            res,
+            withMissingControl(
+              STOCK_HTML,
+              STOCK_SAVE_BUTTON,
+              '<button id="save-item-v2" class="act" type="submit">Commit changes</button>',
             ),
           );
         }
@@ -503,7 +602,13 @@ export async function startStockDesk(options: {
             ? "reject-create"
             : body["mode"] === "missing-control"
               ? "missing-control"
-              : "none";
+              : body["mode"] === "renamed-selector"
+                ? "renamed-selector"
+                : body["mode"] === "relabeled-selector"
+                  ? "relabeled-selector"
+                  : body["mode"] === "css-label-selector"
+                    ? "css-label-selector"
+                    : "none";
         db.prepare("UPDATE faults SET mode = ? WHERE id = 1").run(mode);
         return json(res, 200, { mode });
       }

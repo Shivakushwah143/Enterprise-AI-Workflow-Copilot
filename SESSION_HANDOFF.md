@@ -17,8 +17,71 @@ application resolution is deterministic and refuses ambiguity, and recording
 cancellation exists. Groq and Stagehand are both live and configured. Tests:
 unit 56, API integration 31, extension checks 25, scenario checks 42.
 
+> **M4/M5 are newer than everything above** — see
+> `docs/M4_M5_IMPLEMENTATION.md`: rejected-write classification now uses the
+> engine's halt evidence (`application` vs `policy` vs `unknown`), executions
+> record a memory-use audit with a `memory: enabled | disabled` switch, a
+> reviewed repair is consulted before fresh discovery, and a generic onboarding
+> CLI plus a two-application smoke exist. Measured M4 result on a design-system
+> restyle (control keeps its id, label moves to CSS): **0/3 → 3/3 verified**,
+> repair applied 3/3, no AI calls — memory is decisive when DOM identity is gone
+> but the screen is unchanged. On an id-only change both arms verify (the ladder
+> already covers it). SynTask and Twenty CRM: **BLOCKED** (no URL/token; see
+> `scripts/m5-onboard-app.ts check`). Tests: unit 96, API integration 31, M1–M3
+> smoke 22/22, M5 two-app 13/13.
+>
+> **M1–M3 are newer than everything above** — see
+> `docs/M1_M2_M3_IMPLEMENTATION.md`. Structured failure classification, phase and
+> step timings, engine-verified typed input, parameter binding, live target
+> resolution with explicit refusal, bounded recovery, and episodic/procedural
+> memory in the existing PostgreSQL schema. Tests now: **unit 84**, API
+> integration 31; M1–M3 smoke 22/22. The M0 baseline is in
+> `docs/reliability-baseline.md`.
+
 This file is a state inventory backed by command output. Anything not listed
 under **Evidence** was not verified in this environment.
+
+---
+
+## 0a. M4–M5 additions (2026-10-22)
+
+| Area | Where |
+| --- | --- |
+| Rejected write vs policy refusal | bridge `safety_halt`/`safety_refusal_evidence`/`halt_observed_texts` → `classifyFailure` → `application / APPLICATION_REJECTED` |
+| Memory use audit + switch | `ExecuteSchema.memory`, `executions.memory`, per-step `repairId` |
+| Repair applicability / isolation | `packages/agent/src/memory.ts` (`assessRepair`, `loadRepairDecisions`) |
+| Memory before discovery | `apps/api/src/targets.ts` (recorded → repair → semantic → AI) |
+| M4 comparison runner | `scripts/m4-memory-ab.ts` → `.copilot-data/m4/<stamp>/m4-memory-ab.json` |
+| M5 onboarding CLI | `scripts/m5-onboard-app.ts` (`check`, `onboard`, `verify`) |
+| M5 two-application proof | `scripts/m5-two-apps-smoke.ts` (13/13) |
+
+Open items: no independent app is configured (SynTask/Twenty BLOCKED); memory is
+decisive only where the deterministic ladder has no evidence left (a CSS-rendered
+label), not where the control itself changed appearance — the engine's template
+rung then fails and an engine-side selector override would be required; an
+app-rejected write still has no HTTP status (the app's on-screen message is the
+evidence). New demo fault: `css-label-selector` (and `relabeled-selector`).
+
+---
+
+## 0. M1–M3 additions (2026-10-22)
+
+| Area | Where |
+| --- | --- |
+| Failure origin/code/evidence | `packages/agent/src/failures.ts`; persisted on `executions.failure` |
+| Step + phase timings | bridge `report.json` → adapter → `executions.timings` |
+| Engine-verified typed input | bridge `input_verified` → executor → `execution_steps.detail` |
+| Parameter binding | `packages/agent/src/parameters.ts` |
+| Locator preference ladder | `packages/workflow/src/locators.ts` |
+| Live target resolution + refusal | `apps/api/src/targets.ts` |
+| Bounded AI locator assist (opt-in) | `apps/api/src/stagehand.ts` |
+| Recovery engine | `packages/agent/src/recovery.ts` |
+| Episodic + procedural memory | `execution_memory`, `repairs`; `GET /api/memory/episodes`, `GET/POST /api/repairs(/:id/review)` |
+
+Known boundary: approved bundles are sealed (`BundleIntegrityError` on edit), so
+recovery cannot rewrite a selector; the engine resolves recorded-template drift
+itself and a reviewed repair validates the live control. Details and remaining
+gaps in `docs/M1_M2_M3_IMPLEMENTATION.md`.
 
 ---
 

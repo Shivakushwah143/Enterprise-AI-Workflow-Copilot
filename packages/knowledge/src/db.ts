@@ -27,6 +27,23 @@ export interface Sql {
 
 const SCHEMA_PATH = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
+/**
+ * Columns added after the first release.
+ *
+ * `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a database
+ * created by an earlier version would silently lack these columns. Both
+ * backends are PostgreSQL and support `ADD COLUMN IF NOT EXISTS`, so the
+ * upgrade is idempotent and needs no version table.
+ */
+const COLUMN_MIGRATIONS = [
+  "ALTER TABLE executions ADD COLUMN IF NOT EXISTS failure JSONB",
+  "ALTER TABLE executions ADD COLUMN IF NOT EXISTS timings JSONB",
+  "ALTER TABLE executions ADD COLUMN IF NOT EXISTS recovery JSONB",
+  "ALTER TABLE execution_steps ADD COLUMN IF NOT EXISTS input_verified BOOLEAN",
+  "ALTER TABLE execution_steps ADD COLUMN IF NOT EXISTS resolved_selector TEXT",
+  "ALTER TABLE execution_steps ADD COLUMN IF NOT EXISTS resolution_source TEXT",
+];
+
 async function loadSchema(): Promise<string> {
   return readFile(SCHEMA_PATH, "utf8");
 }
@@ -148,6 +165,9 @@ export async function openDb(options: OpenDbOptions = {}): Promise<Sql> {
   }
 
   for (const statement of splitStatements(schema)) {
+    await sql.exec(statement);
+  }
+  for (const statement of COLUMN_MIGRATIONS) {
     await sql.exec(statement);
   }
 

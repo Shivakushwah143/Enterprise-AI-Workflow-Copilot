@@ -8,6 +8,7 @@
 import { randomUUID } from "node:crypto";
 import type { Plan, Skill, Workflow } from "@copilot/shared";
 import type { IntentResolution, SkillContext } from "./intent.js";
+import { bindParameters } from "./parameters.js";
 
 /** Words that mark a request as consequential even when the workflow is not. */
 const RISKY_INTENT = /\b(delete|remove|refund|transfer|pay|payment|wire|approve|terminate|void|close account)\b/i;
@@ -54,16 +55,26 @@ export function buildPlan(input: BuildPlanInput): Plan {
     }
   }
 
-  const resolvedInputs = chosen
-    ? chosen.skill.requiredInputs
-        .filter((p) => input.resolution.inputs[p.name] !== undefined)
-        .map((p) => ({
-          name: p.name,
-          label: p.label,
-          secret: p.secret,
-          value: p.secret ? null : (input.resolution.inputs[p.name] ?? null),
-        }))
-    : [];
+  // Missing values are decided by the parameter binding, so an input a step
+  // actually consumes is always required and a declared-optional one is not.
+  const bindings = chosen ? bindParameters(chosen.workflow, chosen.skill) : [];
+  const missing = bindings
+    .filter((binding) => binding.required && input.resolution.inputs[binding.name] === undefined)
+    .map((binding) => ({
+      name: binding.name,
+      label: binding.label,
+      required: true,
+      secret: binding.secret,
+    }));
+
+  const resolvedInputs = bindings
+    .filter((binding) => input.resolution.inputs[binding.name] !== undefined)
+    .map((binding) => ({
+      name: binding.name,
+      label: binding.label,
+      secret: binding.secret,
+      value: binding.secret ? null : (input.resolution.inputs[binding.name] ?? null),
+    }));
 
   return {
     id: randomUUID(),
@@ -75,7 +86,7 @@ export function buildPlan(input: BuildPlanInput): Plan {
     applicationId: chosen?.skill.applicationId ?? null,
     confidence: input.resolution.confidence,
     candidates: input.resolution.scores.slice(0, 5),
-    missingInputs: chosen ? input.resolution.missing : [],
+    missingInputs: missing,
     resolvedInputs,
     requiresApproval: approvalReason !== null,
     approvalReason,

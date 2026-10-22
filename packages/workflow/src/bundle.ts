@@ -187,3 +187,15 @@ export async function inspectBundle(bundleDir: string): Promise<InspectedBundle>
   const raw = JSON.parse(await readFile(file, "utf8")) as RawWorkflow;
   return inspectWorkflow(raw);
 }
+
+/**
+ * Bundles are sealed by the engine.
+ *
+ * An execution-time selector rewrite is not possible: `openadapt-flow replay`
+ * recomputes the bundle digest and refuses a modified `workflow.json`
+ * (`BundleIntegrityError: the workflow.json was modified after the manifest was
+ * sealed`). Re-discovery therefore observes and reports drift; changing a step
+ * would require a new recording that the engine seals. Anchors are also
+ * required to carry the template, region and click point captured at record
+ * time, which a synthesized anchor cannot invent.
+ */

@@ -19,6 +19,14 @@ export {
   type RawWorkflow,
 } from "./bundle.js";
 export {
+  locatorCandidates,
+  locatorLadder,
+  hasSemanticFallback,
+  type LocatorCandidate,
+  type LocatorKind,
+  type StableLocator,
+} from "./locators.js";
+export {
   DEMO_APPS,
   demoAppByKey,
   demoAppByUrl,

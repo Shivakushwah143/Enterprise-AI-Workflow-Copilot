@@ -309,8 +309,16 @@ def cmd_replay(args: argparse.Namespace) -> dict[str, Any]:
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     results = []
+    steps_total_ms = 0.0
     for index, item in enumerate(report.get("results", [])):
         resolution = item.get("resolution") or {}
+        # The engine's own per-step evidence. `input_verified` is its check that
+        # a typed value landed in the field; `duration_ms`/`timings` are what
+        # make a slow step attributable. None of this was surfaced before.
+        elapsed = item.get("elapsed_ms")
+        if isinstance(elapsed, (int, float)):
+            steps_total_ms += float(elapsed)
+        field_read = item.get("field_read")
         results.append(
             {
                 "index": index,
@@ -323,9 +331,24 @@ def cmd_replay(args: argparse.Namespace) -> dict[str, Any]:
                 "identity_ok": (item.get("identity") or {}).get("ok"),
                 "risk": item.get("risk"),
                 "error": item.get("error"),
+                "duration_ms": elapsed if isinstance(elapsed, (int, float)) else None,
+                "input_verified": item.get("input_verified"),
+                "field_read": field_read if isinstance(field_read, str) else None,
+                "failure_category": item.get("failure_category"),
+                "resolution_elapsed_ms": resolution.get("elapsed_ms"),
+                # P0: the engine's own refusal evidence. `safety_halt` on its own
+                # says "the step was stopped for safety", not why. These two
+                # fields separate a real policy refusal from an application
+                # that rejected the write (M3 could not tell them apart).
+                "safety_halt": bool(item.get("safety_halt")),
+                "safety_refusal_evidence": item.get("safety_refusal_evidence"),
+                "effect_verified": item.get("effect_verified"),
+                "skip_effect_verify": item.get("skip_effect_verify"),
             }
         )
     halt = report.get("halt") or {}
+    total_ms = report.get("total_ms", 0) or 0
+    engine_overhead_ms = max(0.0, float(total_ms) - steps_total_ms)
     return {
         "ok": True,
         "exit_code": code,
@@ -337,10 +360,16 @@ def cmd_replay(args: argparse.Namespace) -> dict[str, Any]:
         "execution_completed": report.get("execution_completed"),
         "halt_reason": halt.get("reason"),
         "halt_intent": halt.get("intent"),
+        # What the application itself showed when the run stopped. This is how an
+        # app-level rejection (e.g. "Save failed: validation rejected") becomes
+        # distinguishable from a policy refusal. Text only: no response bodies.
+        "halt_observed_texts": halt.get("observed_texts") or [],
         "rung_counts": report.get("rung_counts") or {},
         "heal_count": report.get("heal_count", 0),
         "model_calls": report.get("model_calls", 0),
-        "total_ms": report.get("total_ms", 0),
+        "total_ms": total_ms,
+        "steps_total_ms": steps_total_ms,
+        "engine_overhead_ms": engine_overhead_ms,
         "results": results,
     }
 
