@@ -11,3 +11,8 @@ apps/extension/.wxt/
 coverage/
 *.log
 apps/demo/.data/
+
+# Third-party research clone and local tool state: never committed.
+research/OpenAdapt/
+.agents/
+.freebuff/

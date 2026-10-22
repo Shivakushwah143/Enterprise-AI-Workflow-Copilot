@@ -21,5 +21,12 @@
       "@copilot/agent": ["packages/agent/src/index.ts"]
     }
   },
-  "exclude": ["node_modules", "research", "apps/extension/.output", "apps/extension/.wxt"]
+  "exclude": [
+    "node_modules",
+    "research",
+    "apps/extension",
+    ".copilot-data",
+    "apps/extension/.output",
+    "apps/extension/.wxt"
+  ]
 }

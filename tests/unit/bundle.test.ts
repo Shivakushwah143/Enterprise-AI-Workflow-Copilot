@@ -86,6 +86,32 @@ describe("inspectWorkflow", () => {
     );
   });
 
+  it("accepts schema 2's map-shaped param_specs", () => {
+    const schema2 = inspectWorkflow({
+      schema_version: 2,
+      name: "Create customer",
+      param_specs: {
+        company_name: { name: "company_name", type: "string", required: true },
+        email: { type: "string", required: true },
+      },
+      secret_params: [],
+      steps: [
+        {
+          intent: "type the company name",
+          action: "type",
+          param: "company_name",
+          field_label: "Company name",
+          anchor: { structural: { selector: "#customer-name" } },
+        },
+      ],
+    });
+    expect(schema2.schemaVersion).toBe(2);
+    expect(schema2.params).toEqual([
+      { name: "company_name", label: "company name", required: true, secret: false },
+      { name: "email", label: "email", required: true, secret: false },
+    ]);
+  });
+
   it("falls back to step parameters when the bundle declares none", () => {
     const fallback = inspectWorkflow({
       name: "typed only",

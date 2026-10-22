@@ -28,9 +28,13 @@ export interface IntentResolution {
   notes: string[];
 }
 
+/**
+ * Filler only. Business nouns (`customer`, `stock`, `item`) are deliberately
+ * NOT stopped: they are the terms that discriminate one skill from another.
+ */
 const STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "please", "for", "to", "in", "of", "with", "me",
-  "create", "add", "make", "new", "my", "our", "customer", "customers", "named",
+  "create", "add", "make", "new", "my", "our", "named",
   "called", "this", "that", "it", "on", "at", "into", "can", "you", "i", "want",
   "need", "should", "would", "like", "is", "are", "be", "do",
 ]);
@@ -73,7 +77,9 @@ export function scoreSkills(
       const score = Math.min(1, Number(raw.toFixed(3)));
       const reason = matched.length
         ? `matched ${matched.join(", ")}${triggerHit ? " (explicit trigger)" : ""}`
-        : "no vocabulary overlap";
+        : triggerHit
+          ? "matched an explicit trigger phrase"
+          : "no vocabulary overlap";
       return {
         skillId: context.skill.id,
         skillName: context.skill.name,

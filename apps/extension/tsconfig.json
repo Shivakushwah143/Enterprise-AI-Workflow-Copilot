@@ -12,5 +12,8 @@
       "@copilot/shared": ["../../packages/shared/src/index.ts"]
     }
   },
-  "include": ["entrypoints/**/*", "wxt.config.ts", "env.d.ts", ".wxt/**/*"]
+  "include": ["entrypoints/**/*", "wxt.config.ts", "env.d.ts", ".wxt/**/*"],
+  // The root config excludes this app (it needs JSX + chrome types), so the
+  // exclusion has to be replaced here rather than inherited.
+  "exclude": ["node_modules", ".output", ".wxt"]
 }

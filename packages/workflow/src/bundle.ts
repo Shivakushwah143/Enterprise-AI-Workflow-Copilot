@@ -47,13 +47,32 @@ interface RawStep {
   expect?: RawPostcondition[];
 }
 
+interface RawParamSpec {
+  name?: string;
+  required?: boolean;
+  kind?: string;
+  type?: string;
+}
+
 export interface RawWorkflow {
   schema_version?: number;
   name?: string;
   params?: Record<string, unknown>;
-  param_specs?: { name?: string; required?: boolean; kind?: string }[];
+  /**
+   * Schema 1 emits an array of specs; schema 2 (openadapt-flow 2.x) emits a
+   * map keyed by parameter name. Both are accepted - the engine is the source
+   * of truth for parameter names either way.
+   */
+  param_specs?: RawParamSpec[] | Record<string, RawParamSpec>;
   secret_params?: string[];
   steps?: RawStep[];
+}
+
+function paramSpecs(raw: RawWorkflow): RawParamSpec[] {
+  const specs = raw.param_specs;
+  if (!specs) return [];
+  if (Array.isArray(specs)) return specs;
+  return Object.entries(specs).map(([name, spec]) => ({ ...spec, name: spec?.name ?? name }));
 }
 
 export interface InspectedBundle {
@@ -131,7 +150,7 @@ export function inspectWorkflow(raw: RawWorkflow): InspectedBundle {
 
   const secretParams = new Set(raw.secret_params ?? []);
   const params: ParamSpec[] = [];
-  for (const spec of raw.param_specs ?? []) {
+  for (const spec of paramSpecs(raw)) {
     if (!spec.name) continue;
     params.push({
       name: spec.name,
