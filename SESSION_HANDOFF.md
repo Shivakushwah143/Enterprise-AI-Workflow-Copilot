@@ -4,6 +4,12 @@ Updated: 2026-10-22 (continuation session). Branch `main` (renamed from
 `master` mid-session), last commit before this session:
 `abca67c checkpoint: phase 2 validation and phase 3 integration WIP`.
 
+> Phase 4 (interactive recording, Stagehand v4, PostgreSQL plans, Driver.js
+> guidance, cross-application proof) is documented separately in
+> `PHASE4_VALIDATION.md`. Where the two disagree, Phase 4 is newer: Stagehand is
+> now installed but unconfigured, plans are persisted, and interactive
+> recording is implemented.
+
 This file is a state inventory backed by command output. Anything not listed
 under **Evidence** was not verified in this environment.
 

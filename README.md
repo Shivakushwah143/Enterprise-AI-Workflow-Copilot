@@ -42,11 +42,34 @@ pnpm build:extension
 | `pnpm test:unit` | Bundle inspection, intent/plan, verification, tenant scoping |
 | `pnpm test:integration` | Real HTTP API + PostgreSQL + demo app; includes the "engine claims success, record absent" failure |
 | `pnpm demo:scenarios` | Full lifecycle with the real OpenAdapt engine: record, compile, approve, execute with new inputs, verify, then a deliberate rejected write |
-| `pnpm verify:extension` | Loads the built MV3 extension in Chromium, signs in through the side panel, shows live capabilities/context, executes and displays `VERIFIED` and `FAILED` |
+| `pnpm verify:extension` | Loads the built MV3 extension in Chromium, signs in through the side panel, highlights the recorded control with Driver.js, executes and displays `VERIFIED` and `FAILED` |
+| `TEST_DATABASE_URL=postgres://copilot:copilot@127.0.0.1:5432/copilot pnpm test:integration` | The same suite against Dockerized PostgreSQL + pgvector |
 
 `pnpm demo:scenarios` needs the OpenAdapt engine (below) and exits `2` with the
 reason when it is unavailable. `pnpm verify:extension` re-uses the newest
 compiled bundle from a scenario run.
+
+## Learn my app (interactive recording)
+
+An admin demonstrates a workflow in a real browser: `POST /api/recordings` with
+`mode: "interactive"` opens a headed Chromium session; the admin performs the
+workflow and `POST /api/recordings/:id/stop` finishes it. The bridge passes the
+field names that should become parameters (and any secret fields, whose values
+are never persisted). The recording is then compiled into a draft workflow for
+review and approval. Nothing executes before approval.
+
+The same command accepts an automated stand-in (`--demo`) for CI, which reports
+`driver: synthetic:<app>`; it is never presented as a human demonstration.
+
+## Stagehand (optional AI browser path)
+
+`@browserbasehq/stagehand` v4 is an optional dependency of the API. With model
+credentials configured (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, optionally
+`STAGEHAND_MODEL=provider/model`) the route `/api/stagehand/tasks` can observe
+and act in its own local browser session. It cannot attach to the extension's
+tab. Consequential instructions require `approved: true`; the API never
+self-approves. Without credentials the capability reports `unconfigured` and
+the route returns 503.
 
 ## Engine setup (OpenAdapt)
 
@@ -93,5 +116,5 @@ tests               unit + integration suites
 - The extension's content script only highlights a recorded selector and shows a
   recording indicator. It never clicks or types.
 
-See `SESSION_HANDOFF.md` for the current state inventory, verification evidence
-and remaining blockers.
+See `SESSION_HANDOFF.md` for the state inventory and `PHASE4_VALIDATION.md` for
+the Phase 4 evidence, PASS/FAIL/BLOCKED results and remaining blockers.
