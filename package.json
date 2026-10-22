@@ -1,0 +1,34 @@
+{
+  "name": "enterpriseai-copilot",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.14.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "dev:api": "pnpm --filter @copilot/api dev",
+    "dev:demo": "pnpm --filter @copilot/demo dev",
+    "dev:extension": "pnpm --filter @copilot/extension dev",
+    "seed": "tsx apps/api/src/seed.ts",
+    "demo:scenarios": "tsx scripts/run-scenarios.ts",
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "vitest run tests/e2e",
+    "build:extension": "pnpm --filter @copilot/extension build",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "spawn-sync"]
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

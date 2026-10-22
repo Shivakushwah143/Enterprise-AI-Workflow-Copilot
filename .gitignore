@@ -1,0 +1,13 @@
+node_modules/
+.pnpm-store/
+.copilot-data/
+.env
+.env.local
+.venv-flow/
+.venv/
+apps/extension/.output/
+apps/extension/.wxt/
+**/.turbo/
+coverage/
+*.log
+apps/demo/.data/

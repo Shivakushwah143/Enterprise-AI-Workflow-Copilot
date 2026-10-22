@@ -1,0 +1,22 @@
+{
+  "name": "@copilot/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/server.ts",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "start": "tsx src/server.ts",
+    "seed": "tsx src/seed.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@copilot/agent": "workspace:*",
+    "@copilot/knowledge": "workspace:*",
+    "@copilot/shared": "workspace:*",
+    "@copilot/workflow": "workspace:*",
+    "@hono/node-server": "^1.13.7",
+    "hono": "^4.6.14",
+    "zod": "^3.24.1"
+  }
+}

@@ -1,0 +1,27 @@
+# PostgreSQL + pgvector for the durable knowledge layer.
+#
+#   docker compose up -d
+#   DATABASE_URL=postgres://copilot:copilot@127.0.0.1:5432/copilot pnpm dev:api
+#
+# The API also runs without this file: with no DATABASE_URL it uses embedded
+# PostgreSQL (PGlite) so the demo and tests need no Docker daemon. Both are real
+# PostgreSQL; the difference is only where the process runs.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: copilot
+      POSTGRES_PASSWORD: copilot
+      POSTGRES_DB: copilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - copilot-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U copilot -d copilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  copilot-pgdata:

@@ -1,0 +1,295 @@
+:root {
+  color-scheme: light;
+  --ink: #16213a;
+  --muted: #5b6478;
+  --line: #d7dce7;
+  --accent: #1d3f8f;
+  --ok: #11632f;
+  --warn: #8a5a00;
+  --bad: #a11212;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 14px;
+  color: var(--ink);
+  background: #f7f8fc;
+}
+
+.panel {
+  width: 380px;
+  max-width: 100%;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.brand h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.brand p {
+  margin: 2px 0 0;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 0 0 8px;
+}
+
+h3 {
+  font-size: 14px;
+  margin: 12px 0 4px;
+}
+
+h4 {
+  font-size: 13px;
+  margin: 12px 0 4px;
+}
+
+.card {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.row.space {
+  justify-content: space-between;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin: 8px 0 4px;
+  font-size: 13px;
+}
+
+input,
+textarea {
+  width: 100%;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+}
+
+textarea {
+  resize: vertical;
+}
+
+button {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: 7px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+button.secondary {
+  background: #fff;
+  color: var(--accent);
+}
+
+button.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  text-decoration: underline;
+  padding: 0;
+  margin: 0;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 12px;
+}
+
+.break {
+  word-break: break-all;
+}
+
+.list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.list li {
+  margin-bottom: 4px;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #f2f4fa;
+}
+
+.badge.ok {
+  border-color: #b7dcc3;
+  background: #e8f5ec;
+  color: var(--ok);
+}
+
+.badge.warn {
+  border-color: #ecd9ae;
+  background: #fdf5e4;
+  color: var(--warn);
+}
+
+.alert {
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 13px;
+  border: 1px solid var(--line);
+}
+
+.alert.bad {
+  background: #fdecec;
+  border-color: #f0bcbc;
+  color: var(--bad);
+}
+
+.alert.warn {
+  background: #fdf5e4;
+  border-color: #ecd9ae;
+  color: var(--warn);
+}
+
+.alert.info {
+  background: #eef3fd;
+  border-color: #c6d5f2;
+  color: var(--accent);
+}
+
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-weight: 500;
+  margin-top: 8px;
+}
+
+.check input {
+  width: auto;
+}
+
+.outcome {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 4px 0;
+}
+
+.outcome.ok {
+  color: var(--ok);
+}
+
+.outcome.warn {
+  color: var(--warn);
+}
+
+.outcome.bad {
+  color: var(--bad);
+}
+
+.recording {
+  margin-top: 8px;
+  background: #b00020;
+  color: #fff;
+  font-weight: 700;
+  padding: 7px 12px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.steps {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+}
+
+.steps li {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 2px 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #eef0f6;
+  font-size: 13px;
+}
+
+.steps li .idx {
+  grid-row: span 2;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.steps li .small {
+  grid-column: 2;
+}
+
+.steps li.failed .idx {
+  color: var(--bad);
+}
+
+.steps li.not_run {
+  opacity: 0.6;
+}
+
+.verify {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #eef0f6;
+}
+
+.json {
+  font-size: 11px;
+  background: #f4f6fb;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  overflow-x: auto;
+  max-height: 160px;
+}

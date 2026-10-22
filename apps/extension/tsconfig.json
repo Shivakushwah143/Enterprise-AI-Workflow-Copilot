@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["chrome", "node"],
+    "baseUrl": ".",
+    "noEmit": true,
+    "paths": {
+      "@copilot/shared": ["../../packages/shared/src/index.ts"]
+    }
+  },
+  "include": ["entrypoints/**/*", "wxt.config.ts", ".wxt/**/*"]
+}
