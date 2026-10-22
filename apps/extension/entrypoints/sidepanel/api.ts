@@ -5,6 +5,7 @@
  * locally. Errors carry the server's `{error:{code,message}}` verbatim.
  */
 import type {
+  BrowserSession,
   Capabilities,
   Execution,
   LandingPage,
@@ -22,6 +23,8 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    /** Structured server detail, e.g. ambiguity candidates. */
+    readonly detail: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = "ApiError";
@@ -93,11 +96,14 @@ export async function apiRequest<T>(
   }
 
   if (!response.ok) {
-    const error = payload as { error?: { code?: string; message?: string } } | null;
+    const error = payload as
+      | { error?: { code?: string; message?: string; detail?: Record<string, unknown> } }
+      | null;
     throw new ApiError(
       response.status,
       error?.error?.code ?? "http_error",
       error?.error?.message ?? `Request failed with HTTP ${response.status}`,
+      error?.error?.detail ?? {},
     );
   }
   return payload as T;
@@ -110,10 +116,22 @@ export const api = {
       body: { tenantSlug, email },
     }),
   capabilities: (config: StoredConfig) => apiRequest<Capabilities>(config, "/api/capabilities"),
-  context: (config: StoredConfig, url: string) =>
-    apiRequest<LandingPage>(config, `/api/context?url=${encodeURIComponent(url)}`),
-  plan: (config: StoredConfig, intent: string) =>
-    apiRequest<PlanResponse>(config, "/api/plans", { method: "POST", body: { intent } }),
+  context: (config: StoredConfig, url: string, applicationId: string | null = null) =>
+    apiRequest<LandingPage>(
+      config,
+      `/api/context?url=${encodeURIComponent(url)}${
+        applicationId ? `&applicationId=${encodeURIComponent(applicationId)}` : ""
+      }`,
+    ),
+  plan: (config: StoredConfig, intent: string, applicationId: string | null = null) =>
+    apiRequest<PlanResponse>(config, "/api/plans", {
+      method: "POST",
+      body: applicationId ? { intent, applicationId } : { intent },
+    }),
+  planById: (config: StoredConfig, id: string) =>
+    apiRequest<Plan>(config, `/api/plans/${encodeURIComponent(id)}`),
+  workflow: (config: StoredConfig, id: string) =>
+    apiRequest<Workflow>(config, `/api/workflows/${encodeURIComponent(id)}`),
   execute: (config: StoredConfig, body: { planId: string; inputs: Record<string, string>; approved: boolean }) =>
     apiRequest<Execution>(config, "/api/executions", { method: "POST", body }),
   execution: (config: StoredConfig, id: string) =>
@@ -139,8 +157,33 @@ export const api = {
       `/api/recordings/${recordingId}/stop`,
       { method: "POST", body: {} },
     ),
+  cancelRecording: (config: StoredConfig, id: string) =>
+    apiRequest<Recording & { cancelled: boolean }>(
+      config,
+      `/api/recordings/${encodeURIComponent(id)}/cancel`,
+      { method: "POST", body: {} },
+    ),
   recording: (config: StoredConfig, id: string) =>
     apiRequest<RecordingResponse>(config, `/api/recordings/${id}`),
+  /** Autonomous mode: one controlled browser session, polled by id. */
+  startBrowserSession: (
+    config: StoredConfig,
+    body: {
+      url: string;
+      instruction: string;
+      approved: boolean;
+      planId?: string | null;
+      skillId?: string | null;
+    },
+  ) =>
+    apiRequest<BrowserSession>(config, "/api/stagehand/sessions", {
+      method: "POST",
+      body,
+    }),
+  browserSession: (config: StoredConfig, id: string) =>
+    apiRequest<BrowserSession>(config, `/api/stagehand/sessions/${encodeURIComponent(id)}`),
+  browserSessions: (config: StoredConfig) =>
+    apiRequest<{ items: BrowserSession[] }>(config, "/api/stagehand/sessions"),
   approve: (
     config: StoredConfig,
     workflowId: string,

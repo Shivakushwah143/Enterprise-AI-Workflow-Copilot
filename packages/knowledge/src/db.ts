@@ -115,14 +115,20 @@ class PgliteSql implements Sql {
 export interface OpenDbOptions {
   /** Defaults to `process.env.DATABASE_URL`, then PGlite on disk. */
   url?: string | undefined;
-  /** PGlite data directory (ignored when a URL is given). */
+  /**
+   * PGlite data directory. When set it wins over `DATABASE_URL`: callers that
+   * name a directory are asking for an isolated database, not the live one.
+   */
   dataDir?: string | undefined;
   /** Add `doc_chunks.embedding` when pgvector is present. */
   enableVector?: boolean;
 }
 
 export async function openDb(options: OpenDbOptions = {}): Promise<Sql> {
-  const url = options.url ?? process.env.DATABASE_URL ?? "";
+  // An explicit `dataDir` means "this caller wants the throwaway database": the
+  // demo scripts and the test suite must not silently write to whatever
+  // DATABASE_URL happens to be exported in the shell.
+  const url = options.url ?? (options.dataDir ? "" : (process.env.DATABASE_URL ?? ""));
   const schema = await loadSchema();
   let sql: Sql;
 

@@ -9,8 +9,11 @@
  */
 import path from "node:path";
 import { KnowledgeEngine, Store, openDb } from "@copilot/knowledge";
+import { loadProjectEnv } from "@copilot/shared";
 import { DEMO_APPS } from "@copilot/workflow";
 import { seedDemo } from "./seed-data.js";
+
+loadProjectEnv();
 
 const log = (event: Record<string, unknown>): void => {
   process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);

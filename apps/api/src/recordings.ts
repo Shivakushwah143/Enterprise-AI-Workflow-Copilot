@@ -48,6 +48,13 @@ export interface StartRecordingInput {
  */
 const interactiveSessions = new Map<string, InteractiveRecordingSession>();
 
+/**
+ * Recordings the admin cancelled. The recorder may still flush a partial
+ * artifact when its browser closes; this set makes the lifecycle verdict
+ * "cancelled" instead of letting a cancelled session compile into a skill.
+ */
+const cancelledRecordings = new Set<string>();
+
 export function isRecordingInProgress(recordingId: string): boolean {
   return interactiveSessions.has(recordingId);
 }
@@ -150,6 +157,40 @@ export async function startRecording(
 }
 
 /**
+ * Abandon an interactive recording. The browser is closed, nothing is compiled,
+ * and the row records the cancellation so a half-demonstration cannot become a
+ * skill. Only a live session can be cancelled; anything else is a conflict.
+ */
+export async function cancelInteractiveRecording(
+  deps: RecordingDeps,
+  tenantId: string,
+  recordingId: string,
+): Promise<RecordingRow> {
+  const recording = await deps.store.getRecording(tenantId, recordingId);
+  if (!recording) throw new CopilotError("not_found", "Recording not found.", 404);
+  if (recording.status !== "recording") {
+    throw new CopilotError("conflict", `Recording is already ${recording.status}.`, 409);
+  }
+  const session = interactiveSessions.get(recordingId);
+  if (!session) {
+    throw new CopilotError(
+      "conflict",
+      "This recording is no longer attached to a live browser session, so it cannot be cancelled.",
+      409,
+    );
+  }
+  cancelledRecordings.add(recordingId);
+  await session.stop();
+  await deps.store.updateRecording(tenantId, recordingId, {
+    status: "cancelled",
+    error: "Cancelled by the administrator. Nothing was compiled.",
+    finishedAt: new Date().toISOString(),
+  });
+  deps.log({ event: "recording.cancelled", recordingId });
+  return (await deps.store.getRecording(tenantId, recordingId))!;
+}
+
+/**
  * Ask an in-progress interactive recording to finish. The browser flushes its
  * events and the recording is compiled; the caller polls `/recordings/:id`.
  */
@@ -182,6 +223,9 @@ async function finishInteractive(
 ): Promise<void> {
   try {
     const recorded = await session.result;
+    // Cancellation is decided by the admin's request, not by whether the
+    // recorder happened to flush something on its way out.
+    if (cancelledRecordings.has(job.recording.id)) return;
     if (!recorded.ok) {
       throw new Error(recorded.error ?? "the interactive recording failed");
     }
@@ -205,6 +249,7 @@ async function finishInteractive(
     await fail(deps, job, error);
   } finally {
     interactiveSessions.delete(job.recording.id);
+    cancelledRecordings.delete(job.recording.id);
   }
 }
 

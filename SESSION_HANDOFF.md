@@ -9,6 +9,13 @@ Updated: 2026-10-22 (continuation session). Branch `main` (renamed from
 > `PHASE4_VALIDATION.md`. Where the two disagree, Phase 4 is newer: Stagehand is
 > now installed but unconfigured, plans are persisted, and interactive
 > recording is implemented.
+>
+> **Phase 6 is newer still** (`PHASE6_VALIDATION.md`): the side panel has
+explicit Guided/Autonomous modes with a pre-flight and persisted workspace, AI
+browser operations are tracked as tenant-scoped sessions with progress and TTL,
+application resolution is deterministic and refuses ambiguity, and recording
+cancellation exists. Groq and Stagehand are both live and configured. Tests:
+unit 56, API integration 31, extension checks 25, scenario checks 42.
 
 This file is a state inventory backed by command output. Anything not listed
 under **Evidence** was not verified in this environment.
@@ -107,7 +114,7 @@ for a missing step, capability report honesty, execution history.
 | Requirement | Status |
 | --- | --- |
 | OpenAdapt recording/learning adapter | Working end-to-end (`record-scripted`, `compile`, `replay` through the bridge; schema 2 bundles supported) |
-| Stagehand browser execution | Route + capability reporting implemented; package **not installed**, so `/api/stagehand/tasks` returns 503. AI path intentionally separate from the extension tab |
+| Stagehand browser execution | **Live** (Phase 5/6): v4 installed, Groq-backed, `check:stagehand` 12/12. Autonomous sessions have an id, tenant scope, progress, terminal status and TTL; the AI path is intentionally separate from the extension tab and the panel says so |
 | WXT extension | Builds and runs; verified in Chromium |
 | Driver.js guidance overlay | API supplies recorded selector/instruction; panel sends `COPILOT_HIGHLIGHT`; not highlighted in the verification run (side panel opened as a page, no docked panel), so DOM-level highlight is exercised only by the content script build, not by an assertion |
 | Enterprise knowledge storage/retrieval | PostgreSQL (PGlite here) with tenant scoping, SOP ingestion, keyword retrieval; vector path unconfigured (no provider, no pgvector in PGlite) |
@@ -172,11 +179,18 @@ for a missing step, capability report honesty, execution history.
   this project's adapter (`probe`, `record-scripted`, `compile`, `replay`);
   `research/OpenAdapt/packages/flow/tests` needs that package's `dev` extras and
   is not part of this workspace.
-- **Stagehand is not installed.** `@browserbasehq/stagehand` is absent and no
-  model key is configured, so the capability is reported `blocked` and the route
-  answers 503. This is intentional (optional runtime dependency).
-- **No LLM / embeddings configured.** Intent is deterministic and labelled as
-  such; knowledge retrieval is keyword-only; `/api/capabilities` says so.
+- ~~Stagehand is not installed~~ — superseded: it is installed and configured
+  via Groq. Its controlled browser still cannot attach to the extension's tab;
+  sessions live in the API process and do not survive a restart.
+- ~~No LLM / embeddings configured~~ — superseded for the LLM: Groq answers and
+  the plan reports `method=model`. **Embeddings are still unconfigured**, so
+  vector search remains off and retrieval is keyword-only.
+- **Docked side panel is not automated.** The panel is driven as the extension's
+  own page in real Chromium; Chrome's docked panel is browser UI. A manual pass
+  is in `PHASE6_VALIDATION.md` and is marked HUMAN PENDING.
+- **No unique index on application identity.** Existing duplicate rows prevent
+  one; the resolver refuses ambiguity instead and the remediation plan is
+  documented, not executed.
 - **pgvector unavailable under PGlite.** Vector search requires
   `docker compose up -d` (pgvector image) plus `DATABASE_URL`; not exercised in
   this environment.

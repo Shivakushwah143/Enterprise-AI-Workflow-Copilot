@@ -27,7 +27,9 @@ import path from "node:path";
 import { serve } from "@hono/node-server";
 import { KnowledgeEngine, Store, openDb } from "@copilot/knowledge";
 import { DEMO_APPS, OpenAdaptEngine, fillTemplate, inspectBundle } from "@copilot/workflow";
-import type { VerificationContract } from "@copilot/shared";
+import { loadProjectEnv, type VerificationContract } from "@copilot/shared";
+
+loadProjectEnv();
 import { createApp } from "../apps/api/src/app.js";
 import { seedDemo } from "../apps/api/src/seed-data.js";
 import { startAcmeDesk, startStockDesk } from "../apps/demo/src/apps.js";
@@ -200,14 +202,24 @@ async function main(): Promise<number> {
     check(
       "interactive recorder captured a demonstration in a headed browser",
       standinResult.ok && standinResult.events > 0,
-      `events=${standinResult.events} frames=${standinResult.frames} driver=automated stand-in (NOT a human session)`,
+      `ok=${standinResult.ok} events=${standinResult.events} frames=${standinResult.frames} driver=automated stand-in (NOT a human session)` +
+        (standinResult.error ? ` error="${standinResult.error}"` : ""),
     );
+    // Compiling a recording that already failed only buries the recorder's error
+    // under a compiler error about a missing meta.json. Report the real cause.
     const standinBundle = path.join(runRoot, "interactive", "standin-bundle");
-    const standinCompiled = await engine.compile({
-      recordingDir: standinResult.recordingDir,
-      bundleDir: standinBundle,
-      name: "Interactive stand-in demo",
-    });
+    const standinCompiled = standinResult.ok
+      ? await engine.compile({
+          recordingDir: standinResult.recordingDir,
+          bundleDir: standinBundle,
+          name: "Interactive stand-in demo",
+        })
+      : {
+          ok: false,
+          bundleDir: standinBundle,
+          workflowJson: null,
+          error: `recording failed, nothing to compile: ${standinResult.error ?? "unknown error"}`,
+        };
     const inspectedInteractive = standinCompiled.ok
       ? await inspectBundle(standinBundle)
       : null;
@@ -327,6 +339,13 @@ async function main(): Promise<number> {
         `${demo.name}: the agent selects the approved skill from natural language`,
         plan?.skillId === skill.id,
         `method=${planResponse.body?.method} confidence=${plan?.confidence} intent="${intents[demo.key]!.text}"`,
+      );
+      // Whatever answered, it must say which path it ran: a model plan and a
+      // rule-based plan are not the same evidence.
+      check(
+        `${demo.name}: the plan states how the intent was understood`,
+        planResponse.body?.method === "model" || planResponse.body?.method === "deterministic",
+        `method=${planResponse.body?.method} modelCalls=${planResponse.body?.modelCalls}`,
       );
       const resolved = Object.fromEntries(
         (plan?.resolvedInputs ?? []).map((i: any) => [i.name, i.value]),
@@ -449,6 +468,28 @@ async function main(): Promise<number> {
       "an existing record is refused before anything runs",
       duplicateRun.body?.outcome === "REJECTED",
       `outcome=${duplicateRun.body?.outcome} message="${duplicateRun.body?.message}"`,
+    );
+
+    // An unknown workflow: nothing approved covers it, so nothing may run.
+    const unknownPlan = await api<any>("POST", "/api/plans", {
+      token: employeeToken,
+      body: { intent: "Book a flight to Paris for the sales team next Tuesday" },
+    });
+    check(
+      "a request no approved skill covers is reported as unavailable",
+      unknownPlan.body?.plan?.skillId === null &&
+        Array.isArray(unknownPlan.body?.plan?.blockers) &&
+        unknownPlan.body.plan.blockers.length > 0,
+      `skillId=${unknownPlan.body?.plan?.skillId} blockers=${JSON.stringify(unknownPlan.body?.plan?.blockers)}`,
+    );
+    const unknownRun = await api<any>("POST", "/api/executions", {
+      token: employeeToken,
+      body: { planId: unknownPlan.body?.plan?.id, inputs: {}, approved: true },
+    });
+    check(
+      "an unavailable workflow cannot be executed anyway",
+      unknownRun.status === 409,
+      `HTTP ${unknownRun.status} message="${unknownRun.body?.error?.message ?? ""}"`,
     );
 
     section("5. Execution history and extension context");

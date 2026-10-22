@@ -12,9 +12,14 @@
 import path from "node:path";
 import { serve } from "@hono/node-server";
 import { KnowledgeEngine, Store, openDb } from "@copilot/knowledge";
+import { loadProjectEnv } from "@copilot/shared";
 import { OpenAdaptEngine } from "@copilot/workflow";
 import { createApp } from "./app.js";
 import { createLogger } from "./log.js";
+
+// Before anything reads configuration: the nearest `.env` (the project root),
+// with real environment variables taking precedence.
+const env = loadProjectEnv();
 
 const log = createLogger("api");
 const port = Number(process.env.PORT ?? 4000);
@@ -33,6 +38,8 @@ serve({ fetch: app.fetch, port }, (info) => {
     port: info.port,
     database: sql.kind,
     vector: sql.vectorAvailable(),
+    envFile: env.path,
+    envKeys: env.keys.length,
     artifacts: artifactRoot,
   });
 });

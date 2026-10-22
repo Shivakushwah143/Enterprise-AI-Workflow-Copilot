@@ -246,6 +246,50 @@ export const StartRecordingSchema = z.object({
 });
 
 /* ------------------------------------------------------------------ */
+/* Browser execution modes                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where the work happens. `guided` runs in the employee's own tab and the
+ * employee performs the steps; `autonomous` runs in a controlled browser the
+ * employee is not looking at. The distinction is never inferred: the caller
+ * chooses it explicitly, and nothing switches it silently.
+ */
+export const ExecutionModeSchema = z.enum(["guided", "autonomous"]);
+export type ExecutionMode = z.infer<typeof ExecutionModeSchema>;
+
+/**
+ * One AI-driven browser operation in a controlled session.
+ *
+ * The id is the operation id: progress, audit records and results are all keyed
+ * by it, and it is only readable by the tenant that started it. `targetUrl`
+ * must resolve to an application registered to that tenant.
+ */
+export const BrowserSessionSchema = z.object({
+  id: z.string(),
+  tenantId: z.string(),
+  userId: z.string(),
+  mode: z.literal("autonomous"),
+  /** Stated in the UI so nobody thinks the employee's tab is being driven. */
+  sessionType: z.literal("controlled_browser_session"),
+  applicationId: z.string(),
+  applicationName: z.string(),
+  targetUrl: z.string(),
+  instruction: z.string(),
+  approved: z.boolean(),
+  planId: z.string().nullable(),
+  skillId: z.string().nullable(),
+  status: z.enum(["running", "completed", "failed", "cancelled", "expired"]),
+  summary: z.string().nullable(),
+  actions: z.array(z.string()),
+  observed: z.unknown().nullable(),
+  error: z.string().nullable(),
+  startedAt: z.string(),
+  finishedAt: z.string().nullable(),
+});
+export type BrowserSession = z.infer<typeof BrowserSessionSchema>;
+
+/* ------------------------------------------------------------------ */
 /* Intent -> plan -> execution                                         */
 /* ------------------------------------------------------------------ */
 
@@ -425,6 +469,23 @@ export const CapabilitiesSchema = z.object({
     status: CapabilityStatusSchema,
     detail: z.string(),
   }),
+  /**
+   * The two execution modes as the server sees them. The panel renders exactly
+   * these labels, so what the employee reads is not wording invented in the UI.
+   */
+  browserModes: z.object({
+    guided: z.object({
+      available: z.literal(true),
+      label: z.string(),
+      context: z.string(),
+    }),
+    autonomous: z.object({
+      status: CapabilityStatusSchema,
+      label: z.string(),
+      context: z.string(),
+      detail: z.string(),
+    }),
+  }),
   database: z.object({
     kind: z.enum(["postgres", "pglite"]),
     tenancyEnforced: z.literal(true),
@@ -444,6 +505,7 @@ export class CopilotError extends Error {
       | "not_found"
       | "invalid_request"
       | "conflict"
+      | "application_ambiguous"
       | "capability_unavailable"
       | "engine_failure"
       | "verification_failed",
@@ -455,3 +517,16 @@ export class CopilotError extends Error {
     this.name = "CopilotError";
   }
 }
+
+/* ---------------- environment ---------------- */
+
+export {
+  parseDotEnv,
+  isConfiguredValue,
+  envValue,
+  envUrl,
+  findEnvFile,
+  loadProjectEnv,
+  describeUrl,
+  type EnvFileResult,
+} from "./env.js";

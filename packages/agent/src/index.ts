@@ -1,4 +1,11 @@
-export { configuredLlm, llmStatus, parseJsonObject, type LlmClient, type LlmStatus } from "./llm.js";
+export {
+  configuredLlm,
+  llmStatus,
+  parseJsonObject,
+  DEFAULT_GROQ_MODEL,
+  type LlmClient,
+  type LlmStatus,
+} from "./llm.js";
 export {
   resolveIntent,
   scoreSkills,

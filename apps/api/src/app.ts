@@ -38,8 +38,18 @@ import {
 import { configuredEmbeddingProvider } from "@copilot/knowledge";
 import { inspectBundle, type WorkflowEngine } from "@copilot/workflow";
 import { createLogger, type Logger } from "./log.js";
-import { startRecording, stopInteractiveRecording } from "./recordings.js";
-import { runStagehandTask, stagehandStatus } from "./stagehand.js";
+import {
+  cancelInteractiveRecording,
+  startRecording,
+  stopInteractiveRecording,
+} from "./recordings.js";
+import {
+  getBrowserSession,
+  listBrowserSessions,
+  runStagehandTask,
+  stagehandStatus,
+  startAutonomousSession,
+} from "./stagehand.js";
 
 export interface ApiDeps {
   store: Store;
@@ -179,6 +189,19 @@ export function createApp(deps: ApiDeps) {
       },
       vectorSearch: vector,
       stagehand,
+      browserModes: {
+        guided: {
+          available: true,
+          label: "Guided",
+          context: "Current browser tab",
+        },
+        autonomous: {
+          status: stagehand.status,
+          label: "Autonomous",
+          context: "Controlled browser session",
+          detail: stagehand.detail,
+        },
+      },
       database: { kind: deps.store.sql.kind, tenancyEnforced: true },
     };
     return c.json(payload);
@@ -233,23 +256,55 @@ export function createApp(deps: ApiDeps) {
     const session = c.get("session");
     requirePermission(session, "application:write");
     const body = RegisterApplicationSchema.parse(await c.req.json());
-    const application = await deps.store.createApplication({
+    // Registration is idempotent per (tenant, normalized base URL): the same
+    // application registered twice is the same row, so a second registration
+    // cannot leave a duplicate for the resolver to trip over.
+    const { application, created } = await deps.store.ensureApplication({
       tenantId: session.tenant.id,
       name: body.name,
       baseUrl: body.baseUrl,
       verificationBaseUrl: body.verificationBaseUrl,
       kind: body.kind,
     });
-    logger({ event: "application.registered", applicationId: application.id });
-    return c.json(application, 201);
+    logger({
+      event: created ? "application.registered" : "application.registration_reused",
+      applicationId: application.id,
+    });
+    return c.json({ ...application, reused: !created }, created ? 201 : 200);
   });
 
   app.get("/api/context", async (c) => {
     const session = c.get("session");
     const url = c.req.query("url") ?? "";
-    const application = url
-      ? await deps.store.findApplicationForUrl(session.tenant.id, url)
+    const selectedId = c.req.query("applicationId") ?? "";
+
+    // An explicit choice (the employee picked from the ambiguity candidates) is
+    // tenant-scoped here and must not be trusted from any other source.
+    let application = selectedId
+      ? await deps.store.getApplication(session.tenant.id, selectedId)
       : null;
+    if (selectedId && !application) {
+      throw new CopilotError("not_found", "Application not found in this tenant.", 404);
+    }
+    if (!application && url) {
+      const resolution = await deps.store.resolveApplicationForUrl(session.tenant.id, url);
+      if (resolution.status === "ambiguous") {
+        throw new CopilotError(
+          "application_ambiguous",
+          `${resolution.candidates.length} registered applications match this page, so none can be chosen automatically. Choose the application to use.`,
+          409,
+          {
+            candidates: resolution.candidates.map((candidate) => ({
+              id: candidate.id,
+              name: candidate.name,
+              baseUrl: candidate.baseUrl,
+              createdAt: candidate.createdAt,
+            })),
+          },
+        );
+      }
+      application = resolution.status === "resolved" ? resolution.application : null;
+    }
     const skills = await deps.store.listSkills(session.tenant.id, "active");
     const suggested = application
       ? skills.filter((s) => s.applicationId === application.id)
@@ -334,6 +389,22 @@ export function createApp(deps: ApiDeps) {
       },
       202,
     );
+  });
+
+  app.post("/api/recordings/:id/cancel", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "application:write");
+    const recording = await cancelInteractiveRecording(
+      {
+        store: deps.store,
+        engine: deps.engine,
+        artifactRoot: deps.artifactRoot,
+        log: logger,
+      },
+      session.tenant.id,
+      c.req.param("id"),
+    );
+    return c.json({ ...recording, recording: false, cancelled: true });
   });
 
   app.get("/api/recordings/:id", async (c) => {
@@ -463,7 +534,19 @@ export function createApp(deps: ApiDeps) {
   app.post("/api/plans", async (c) => {
     const session = c.get("session");
     const body = IntentRequestSchema.parse(await c.req.json());
-    const contexts = await loadContexts(deps, session.tenant.id);
+    let contexts = await loadContexts(deps, session.tenant.id);
+    // When the page's application is known, only that application's skills are
+    // candidates: a duplicate or a neighbouring app must never supply the skill.
+    if (body.applicationId) {
+      const application = await deps.store.getApplication(
+        session.tenant.id,
+        body.applicationId,
+      );
+      if (!application) {
+        throw new CopilotError("not_found", "Application not found in this tenant.", 404);
+      }
+      contexts = contexts.filter((context) => context.skill.applicationId === application.id);
+    }
     const resolution = await resolveIntent(contexts, body.intent);
     const plan = buildPlan({
       tenantId: session.tenant.id,
@@ -633,6 +716,100 @@ export function createApp(deps: ApiDeps) {
       ok: result.ok,
     });
     return c.json(result);
+  });
+
+  /**
+   * Autonomous mode: start a controlled browser session and return its id.
+   *
+   * The target URL must resolve to an application registered to *this* tenant,
+   * so an employee cannot aim the AI browser at an arbitrary host. The approval
+   * gate runs inside `startAutonomousSession` before a browser is opened.
+   */
+  app.post("/api/stagehand/sessions", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "skill:execute");
+    const body = z
+      .object({
+        url: z.string().url(),
+        instruction: z.string().min(4).max(500),
+        approved: z.boolean().default(false),
+        planId: z.string().nullable().default(null),
+        skillId: z.string().nullable().default(null),
+      })
+      .parse(await c.req.json());
+
+    const resolution = await deps.store.resolveApplicationForUrl(session.tenant.id, body.url);
+    if (resolution.status === "ambiguous") {
+      throw new CopilotError(
+        "application_ambiguous",
+        `${resolution.candidates.length} registered applications match this page, so none can be chosen automatically. Choose the application to use.`,
+        409,
+        {
+          candidates: resolution.candidates.map((candidate) => ({
+            id: candidate.id,
+            name: candidate.name,
+            baseUrl: candidate.baseUrl,
+          })),
+        },
+      );
+    }
+    if (resolution.status === "none") {
+      throw new CopilotError(
+        "invalid_request",
+        "This page is not a registered application for this tenant, so the controlled browser cannot be pointed at it.",
+        400,
+      );
+    }
+    const application = resolution.application;
+
+    // If a plan or skill is named, it must be this tenant's and belong to the
+    // same application: a session can never borrow a workflow from elsewhere.
+    if (body.skillId) {
+      const skill = await deps.store.getSkill(session.tenant.id, body.skillId);
+      if (!skill || skill.applicationId !== application.id) {
+        throw new CopilotError("not_found", "Skill not found for this application.", 404);
+      }
+    }
+    if (body.planId) {
+      const plan = await deps.store.getPlan(session.tenant.id, body.planId);
+      if (!plan) throw new CopilotError("not_found", "Plan not found or expired.", 404);
+    }
+
+    const created = await startAutonomousSession({
+      tenantId: session.tenant.id,
+      userId: session.user.id,
+      applicationId: application.id,
+      applicationName: application.name,
+      targetUrl: body.url,
+      instruction: body.instruction,
+      approved: body.approved,
+      planId: body.planId,
+      skillId: body.skillId,
+      log: logger,
+    });
+    return c.json(created, 202);
+  });
+
+  app.get("/api/stagehand/sessions", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "execution:read");
+    return c.json({ items: listBrowserSessions(session.tenant.id, 10) });
+  });
+
+  app.get("/api/stagehand/sessions/:id", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "execution:read");
+    const found = getBrowserSession(session.tenant.id, c.req.param("id"));
+    // A session id from another tenant, or one that has expired, is not found:
+    // the API never confirms that someone else's browser operation exists.
+    if (!found) {
+      throw new CopilotError(
+        "not_found",
+        "Browser session not found. It may have finished and expired; start a new session.",
+        404,
+      );
+    }
+    return c.json(found);
   });
 
   return app;

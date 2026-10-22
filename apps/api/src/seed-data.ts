@@ -53,18 +53,15 @@ export async function seedDemo(
 
   const applications: { demo: DemoApp; application: Application }[] = [];
   for (const demo of DEMO_APPS) {
-    const existing = (await store.listApplications(demoTenant.id)).find(
-      (a) => a.name === demo.name,
-    );
-    const application =
-      existing ??
-      (await store.createApplication({
-        tenantId: demoTenant.id,
-        name: demo.name,
-        baseUrl: demo.baseUrl,
-        verificationBaseUrl: demo.baseUrl,
-        kind: "browser",
-      }));
+    // Identity is the normalized base URL, so re-seeding cannot leave a second
+    // row for the same application behind.
+    const { application } = await store.ensureApplication({
+      tenantId: demoTenant.id,
+      name: demo.name,
+      baseUrl: demo.baseUrl,
+      verificationBaseUrl: demo.baseUrl,
+      kind: "browser",
+    });
     applications.push({ demo, application });
   }
 

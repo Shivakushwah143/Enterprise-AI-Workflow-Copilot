@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  BrowserSession,
   Capabilities,
   Execution,
+  ExecutionMode,
   Guidance,
   LandingPage,
   Recording,
@@ -17,6 +19,7 @@ import {
 } from "./api.js";
 
 const STORAGE_KEY = "copilot.session";
+const WORKSPACE_KEY = "copilot.workspace";
 
 function messageOf(error: unknown): string {
   if (error instanceof ApiError) return `${error.code}: ${error.message}`;
@@ -48,6 +51,43 @@ function saveConfig(config: StoredConfig | null): Promise<void> {
   });
 }
 
+/**
+ * In-flight work survives closing and reopening the panel.
+ *
+ * Only identifiers and the last plan are stored; everything shown is re-read
+ * from the API on restore, so a reopened panel can never display a cached
+ * "success" that the server would not repeat.
+ */
+interface Workspace {
+  mode: ExecutionMode;
+  planResult: PlanResponse | null;
+  executionId: string | null;
+  recordingId: string | null;
+  workflowId: string | null;
+  browserSessionId: string | null;
+  applicationChoice: { id: string; baseUrl: string } | null;
+}
+
+function loadWorkspace(): Promise<Partial<Workspace>> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(WORKSPACE_KEY, (result) => {
+      resolve((result[WORKSPACE_KEY] as Partial<Workspace> | undefined) ?? {});
+    });
+  });
+}
+
+function saveWorkspace(workspace: Workspace): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [WORKSPACE_KEY]: workspace }, () => resolve());
+  });
+}
+
+function clearWorkspace(): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.storage.local.remove(WORKSPACE_KEY, () => resolve());
+  });
+}
+
 function queryTabs(query: chrome.tabs.QueryInfo): Promise<chrome.tabs.Tab[]> {
   return new Promise((resolve) => {
     chrome.tabs.query(query, (tabs) => resolve(tabs ?? []));
@@ -57,7 +97,15 @@ function queryTabs(query: chrome.tabs.QueryInfo): Promise<chrome.tabs.Tab[]> {
 interface TabResponse {
   ok: boolean;
   highlighted?: boolean;
+  found?: boolean;
+  visible?: boolean;
   reason?: string;
+}
+
+interface AmbiguousApplication {
+  id: string;
+  name: string;
+  baseUrl: string;
 }
 
 const OUTCOME_CLASS: Record<string, string> = {
@@ -107,7 +155,26 @@ export default function App() {
   const [guidance, setGuidance] = useState<Guidance | null>(null);
   const [guidanceNote, setGuidanceNote] = useState<string | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
+  const [stepCheck, setStepCheck] = useState<{
+    found: boolean;
+    visible: boolean;
+    reason: string;
+  } | null>(null);
+
+  // Execution mode is chosen by the user and persisted; nothing switches it.
+  const [mode, setMode] = useState<ExecutionMode>("autonomous");
+  const [plannedWorkflow, setPlannedWorkflow] = useState<Workflow | null>(null);
+  const [browserSession, setBrowserSession] = useState<BrowserSession | null>(null);
+  const [ambiguous, setAmbiguous] = useState<AmbiguousApplication[]>([]);
+  // An explicit choice is only valid for the page it was made on; carrying it
+  // to another application would execute the wrong skill.
+  const [applicationChoice, setApplicationChoice] = useState<{
+    id: string;
+    baseUrl: string;
+  } | null>(null);
   const pollTimer = useRef<number | null>(null);
+  const sessionTimer = useRef<number | null>(null);
+  const restored = useRef(false);
 
   const role: Role | null = config.role;
   const isAdmin = role === "admin";
@@ -126,17 +193,17 @@ export default function App() {
   }, []);
 
   const sendToTab = useCallback(
-    async (message: unknown): Promise<TabResponse> => {
+    async <T extends TabResponse = TabResponse,>(message: unknown): Promise<T> => {
       const tab = await findTargetTab();
-      if (tab?.id === undefined) return { ok: false, reason: "no-target-tab" };
-      return new Promise<TabResponse>((resolve) => {
+      if (tab?.id === undefined) return { ok: false, reason: "no-target-tab" } as T;
+      return new Promise<T>((resolve) => {
         chrome.tabs.sendMessage(tab.id as number, message, (response: unknown) => {
           const lastError = chrome.runtime.lastError;
           if (lastError) {
-            resolve({ ok: false, reason: lastError.message ?? "unreachable" });
+            resolve({ ok: false, reason: lastError.message ?? "unreachable" } as T);
             return;
           }
-          resolve((response as TabResponse | undefined) ?? { ok: false, reason: "no-response" });
+          resolve((response as T | undefined) ?? ({ ok: false, reason: "no-response" } as T));
         });
       });
     },
@@ -151,12 +218,29 @@ export default function App() {
       setContext(null);
       return;
     }
+    const chosen =
+      applicationChoice && url.startsWith(applicationChoice.baseUrl)
+        ? applicationChoice.id
+        : null;
+    if (applicationChoice && !chosen) setApplicationChoice(null);
     try {
-      setContext(await api.context(config, url));
+      const next = await api.context(config, url, chosen);
+      setContext(next);
+      setAmbiguous([]);
     } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "application_ambiguous") {
+        const candidates = (cause.detail["candidates"] ?? []) as AmbiguousApplication[];
+        setAmbiguous(candidates);
+        setContext(null);
+        setError(null);
+        setNotice(
+          "This page matches more than one registered application. Choose the one this page is.",
+        );
+        return;
+      }
       setError(messageOf(cause));
     }
-  }, [config, findTargetTab]);
+  }, [config, findTargetTab, applicationChoice]);
 
   useEffect(() => {
     void loadConfig().then((stored) => {
@@ -185,9 +269,102 @@ export default function App() {
   useEffect(
     () => () => {
       if (pollTimer.current !== null) window.clearTimeout(pollTimer.current);
+      if (sessionTimer.current !== null) window.clearTimeout(sessionTimer.current);
     },
     [],
   );
+
+  /* ---------------- restore in-flight work after reopening ---------------- */
+
+  useEffect(() => {
+    if (!ready || !config.token || restored.current) return;
+    restored.current = true;
+    void (async () => {
+      const workspace = await loadWorkspace();
+      if (workspace.mode === "guided" || workspace.mode === "autonomous") {
+        setMode(workspace.mode);
+      }
+      if (workspace.applicationChoice) setApplicationChoice(workspace.applicationChoice);
+      if (workspace.planResult?.plan?.id) {
+        try {
+          // Re-read the plan: an expired plan must not look usable.
+          const plan = await api.planById(config, workspace.planResult.plan.id);
+          setPlanResult({ ...workspace.planResult, plan });
+          if (plan.workflowId) {
+            try {
+              setPlannedWorkflow(await api.workflow(config, plan.workflowId));
+            } catch {
+              /* the workflow may be gone; the plan still shows the skill name */
+            }
+          }
+        } catch {
+          setNotice("The previous plan expired. State the outcome again.");
+        }
+      }
+      if (workspace.executionId) {
+        try {
+          setExecution(await api.execution(config, workspace.executionId));
+        } catch {
+          /* execution history is advisory when restored */
+        }
+      }
+      if (workspace.recordingId) {
+        try {
+          const response = await api.recording(config, workspace.recordingId);
+          setRecording(response.recording);
+          if (response.workflow) setDraftWorkflow(response.workflow);
+          if (response.recording.status === "recording") {
+            setNotice("A recording is still live; resuming its status.");
+            pollRecording(response.recording.id);
+          }
+        } catch {
+          /* a finished recording is not necessarily restorable */
+        }
+      }
+      if (workspace.workflowId) {
+        try {
+          setDraftWorkflow(await api.workflow(config, workspace.workflowId));
+        } catch {
+          /* the draft may have been rejected or removed */
+        }
+      }
+      if (workspace.browserSessionId) {
+        try {
+          const session = await api.browserSession(config, workspace.browserSessionId);
+          setBrowserSession(session);
+          if (session.status === "running") pollBrowserSession(session.id);
+        } catch {
+          setNotice("The previous browser session has ended. Start a new one if needed.");
+        }
+      }
+    })();
+    // Restore exactly once per signed-in session.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, config.token]);
+
+  useEffect(() => {
+    if (!ready || !config.token || !restored.current) return;
+    void saveWorkspace({
+      mode,
+      planResult,
+      executionId: execution?.id ?? null,
+      recordingId: recording?.id ?? null,
+      workflowId: draftWorkflow?.id ?? null,
+      browserSessionId: browserSession?.id ?? null,
+      applicationChoice,
+    });
+  }, [
+    ready,
+    config.token,
+    mode,
+    planResult,
+    execution,
+    recording,
+    draftWorkflow,
+    browserSession,
+    applicationChoice,
+    context?.applicationId,
+  ]);
 
   const login = async (): Promise<void> => {
     setError(null);
@@ -218,6 +395,12 @@ export default function App() {
     setExecution(null);
     setRecording(null);
     setDraftWorkflow(null);
+    setBrowserSession(null);
+    setPlannedWorkflow(null);
+    setAmbiguous([]);
+    setApplicationChoice(null);
+    restored.current = false;
+    await clearWorkspace();
   };
 
   const createPlan = async (): Promise<void> => {
@@ -227,10 +410,25 @@ export default function App() {
     setPlanResult(null);
     setExecution(null);
     setApprovalChecked(false);
+    setBrowserSession(null);
+    setPlannedWorkflow(null);
     try {
-      const response = await api.plan(config, intent);
+      const response = await api.plan(
+        config,
+        intent,
+        applicationChoice?.id ?? context?.applicationId ?? null,
+      );
       setPlanResult(response);
       setInputValues({});
+      // The pre-flight needs the real step list and risks of the selected
+      // workflow, not a summary invented here.
+      if (response.plan.workflowId) {
+        try {
+          setPlannedWorkflow(await api.workflow(config, response.plan.workflowId));
+        } catch {
+          setPlannedWorkflow(null);
+        }
+      }
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -257,6 +455,112 @@ export default function App() {
       });
       setExecution(result);
     } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) {
+        setPlanResult(null);
+        setPlannedWorkflow(null);
+        setNotice("That plan was not found or has expired. State the outcome again.");
+        return;
+      }
+      setError(messageOf(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const cancelRecording = async (): Promise<void> => {
+    if (!recording) return;
+    setBusy("record-cancel");
+    setError(null);
+    try {
+      const cancelled = await api.cancelRecording(config, recording.id);
+      setRecording(cancelled);
+      if (pollTimer.current !== null) window.clearTimeout(pollTimer.current);
+      await sendToTab({ type: "COPILOT_RECORDING_INDICATOR", active: false });
+      setDraftWorkflow(null);
+      setNotice("Recording cancelled. Nothing was compiled and no skill was created.");
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** Guided mode: ask the page whether the recorded control is really there. */
+  const verifyCurrentStep = async (): Promise<void> => {
+    const selector = guidance?.selector ?? null;
+    if (!selector) {
+      setStepCheck({
+        found: false,
+        visible: false,
+        reason: "No recorded selector for this step, so nothing can be checked.",
+      });
+      return;
+    }
+    const response = await sendToTab({ type: "COPILOT_VERIFY_STEP", selector });
+    setStepCheck({
+      found: Boolean(response.found),
+      visible: Boolean(response.visible),
+      reason: response.reason ?? "unknown",
+    });
+  };
+
+  const pollBrowserSession = (sessionId: string): void => {
+    let attempts = 0;
+    const tick = async (): Promise<void> => {
+      attempts += 1;
+      try {
+        const session = await api.browserSession(config, sessionId);
+        setBrowserSession(session);
+        if (session.status !== "running") return;
+        if (attempts > 120) {
+          setError("The browser session is taking too long; check the execution history.");
+          return;
+        }
+        sessionTimer.current = window.setTimeout(() => void tick(), 1500);
+      } catch (cause) {
+        // A session the server no longer knows about has ended; say so rather
+        // than leaving a stale "running" badge on screen.
+        if (cause instanceof ApiError && cause.status === 404) {
+          setNotice("The browser session ended. Start a new one if the task is unfinished.");
+          setBrowserSession((current) =>
+            current && current.id === sessionId
+              ? { ...current, status: "expired", finishedAt: new Date().toISOString() }
+              : current,
+          );
+          return;
+        }
+        setError(messageOf(cause));
+      }
+    };
+    sessionTimer.current = window.setTimeout(() => void tick(), 1200);
+  };
+
+  const runAutonomous = async (): Promise<void> => {
+    if (!tabUrl) {
+      setError("Open the target application in a tab first.");
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setBusy("autonomous");
+    setBrowserSession(null);
+    if (sessionTimer.current !== null) window.clearTimeout(sessionTimer.current);
+    try {
+      const created = await api.startBrowserSession(config, {
+        url: tabUrl,
+        instruction: intent,
+        approved: approvalChecked,
+        planId: planResult?.plan.id ?? null,
+        skillId: planResult?.plan.skillId ?? null,
+      });
+      setBrowserSession(created);
+      pollBrowserSession(created.id);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "application_ambiguous") {
+        setAmbiguous((cause.detail["candidates"] ?? []) as AmbiguousApplication[]);
+        setNotice("Choose which application this page is before starting a session.");
+        return;
+      }
       setError(messageOf(cause));
     } finally {
       setBusy(null);
@@ -594,6 +898,62 @@ export default function App() {
           </section>
 
           <section className="card">
+            <h2>Execution mode</h2>
+            <select
+              data-testid="mode-select"
+              value={mode}
+              onChange={(event) =>
+                setMode(event.target.value === "guided" ? "guided" : "autonomous")
+              }
+            >
+              <option value="guided">Guided — I perform it in this tab</option>
+              <option value="autonomous">Autonomous — a controlled browser does it</option>
+            </select>
+            <p className="small" data-testid="execution-mode">
+              {mode === "guided"
+                ? `${capabilities?.browserModes.guided.label ?? "Guided"} — ${
+                    capabilities?.browserModes.guided.context ?? "Current browser tab"
+                  }`
+                : `${capabilities?.browserModes.autonomous.label ?? "Autonomous"} — ${
+                    capabilities?.browserModes.autonomous.context ?? "Controlled browser session"
+                  }`}
+            </p>
+            <p className="muted small" data-testid="execution-mode-detail">
+              {mode === "guided"
+                ? "You perform each step in your own tab. The copilot highlights the recorded control and checks it is there; it never acts for you."
+                : "The copilot works in a separate controlled browser, not in your tab. An approved workflow still needs your explicit approval before it runs."}
+            </p>
+            {ambiguous.length > 0 ? (
+              <div className="alert warn" data-testid="ambiguous-applications">
+                <strong>Which application is this page?</strong>
+                <ul className="list">
+                  {ambiguous.map((candidate) => (
+                    <li key={candidate.id}>
+                      <button
+                        type="button"
+                        className="link"
+                        data-testid={`choose-application-${candidate.id}`}
+                        onClick={() => {
+                          setApplicationChoice({ id: candidate.id, baseUrl: candidate.baseUrl });
+                          setAmbiguous([]);
+                          setNotice(null);
+                        }}
+                      >
+                        {candidate.name}
+                      </button>
+                      <span className="muted small"> {candidate.baseUrl}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="muted small">
+                  Several registered applications share this identity. Nothing is
+                  chosen automatically.
+                </p>
+              </div>
+            ) : null}
+          </section>
+
+          <section className="card">
             <h2>Ask for an outcome</h2>
             <textarea
               data-testid="intent-input"
@@ -604,7 +964,12 @@ export default function App() {
             <button
               type="button"
               data-testid="plan-submit"
-              disabled={busy === "plan" || intent.trim().length < 3}
+              disabled={
+                busy === "plan" ||
+                busy === "execute" ||
+                busy === "autonomous" ||
+                intent.trim().length < 3
+              }
               onClick={() => void createPlan()}
             >
               {busy === "plan" ? "Planning…" : "Plan"}
@@ -691,14 +1056,110 @@ export default function App() {
                   </label>
                 )}
 
-                <button
-                  type="button"
-                  data-testid="execute-button"
-                  disabled={busy === "execute" || plan.blockers.length > 0}
-                  onClick={() => void runExecution()}
-                >
-                  {busy === "execute" ? "Executing…" : "Execute workflow"}
-                </button>
+                {mode === "guided" ? (
+                  <p className="alert info" data-testid="guided-note">
+                    Guided mode does not act for you. Use “Highlight” and
+                    “Check this step” to walk through the approved workflow in this
+                    tab, or switch to Autonomous to have the copilot run it in a
+                    controlled browser.
+                  </p>
+                ) : (
+                  <div className="stack" data-testid="autonomous-preflight">
+                    <h3>Controlled browser session</h3>
+                    <p className="small" data-testid="session-target">
+                      Target application: {context?.appName ?? "not registered"} ·{" "}
+                      {tabUrl || "no page detected"}
+                    </p>
+                    <p className="small" data-testid="session-skill">
+                      Selected skill: {plan.skillName ?? "none — no approved workflow covers this"}
+                    </p>
+                    <p className="small" data-testid="session-type">
+                      Session type:{" "}
+                      {capabilities?.browserModes.autonomous.context ??
+                        "Controlled browser session"}{" "}
+                      (not your tab)
+                    </p>
+                    <div data-testid="session-inputs">
+                      <p className="small">Inputs</p>
+                      <ul className="list muted small">
+                        {plan.resolvedInputs.map((input) => (
+                          <li key={input.name}>
+                            {input.name} = {input.secret ? "••••" : input.value ?? "(missing)"}
+                          </li>
+                        ))}
+                        {missingInputs.map((input) => (
+                          <li key={input.name}>
+                            {input.name} = {inputValues[input.name] ? "(supplied)" : "(missing)"}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div data-testid="session-actions">
+                      <p className="small">Requested actions</p>
+                      <ol className="steps">
+                        {(plannedWorkflow?.steps ?? []).map((step) => (
+                          <li key={step.id}>
+                            <span className="idx">{step.index + 1}</span>
+                            <span>{step.intent}</span>
+                            <span className="muted small"> {step.risk}</span>
+                          </li>
+                        ))}
+                        {(plannedWorkflow?.steps ?? []).length === 0 ? (
+                          <li className="muted small">No approved workflow steps are bound.</li>
+                        ) : null}
+                      </ol>
+                    </div>
+                    <p className="small" data-testid="session-impact">
+                      Expected impact:{" "}
+                      {plan.requiresApproval
+                        ? `writes to ${context?.appName ?? "the application"}; the result is only accepted after an independent read-back.`
+                        : "read-only; no write is requested by this plan."}
+                    </p>
+                    <p className="small" data-testid="session-approval">
+                      {plan.requiresApproval
+                        ? approvalChecked
+                          ? "You approved this run."
+                          : "Approval is required before this run can start."
+                        : "No consequential step, so no approval is required."}
+                    </p>
+                    <button
+                      type="button"
+                      data-testid="execute-button"
+                      disabled={
+                        busy === "execute" ||
+                        busy === "autonomous" ||
+                        plan.blockers.length > 0 ||
+                        (plan.requiresApproval && !approvalChecked) ||
+                        missingInputs.some((input) => !inputValues[input.name])
+                      }
+                      onClick={() => void runExecution()}
+                    >
+                      {busy === "execute" ? "Executing…" : "Execute approved workflow"}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary"
+                      data-testid="stagehand-run"
+                      // The AI path exists for the case no approved workflow
+                      // covers, so plan blockers do not disable it; the policy
+                      // gate and approval still do.
+                      disabled={
+                        busy === "autonomous" ||
+                        busy === "execute" ||
+                        (plan.requiresApproval && !approvalChecked)
+                      }
+                      onClick={() => void runAutonomous()}
+                    >
+                      {busy === "autonomous"
+                        ? "Starting session…"
+                        : "Run in AI browser session"}
+                    </button>
+                    <p className="muted small">
+                      The AI browser starts from the same request and is bounded; it
+                      reports what it actually did and never claims your tab was used.
+                    </p>
+                  </div>
+                )}
                 <p className="muted small">
                   The agent never fills a missing input itself: it asks, then runs.
                 </p>
@@ -803,7 +1264,12 @@ export default function App() {
                 <button
                   type="button"
                   data-testid="record-start"
-                  disabled={busy === "record" || recording?.status === "recording"}
+                  disabled={
+                    busy === "record" ||
+                    busy === "execute" ||
+                    busy === "autonomous" ||
+                    recording?.status === "recording"
+                  }
                   onClick={() => void startRecording()}
                 >
                   Start recording
@@ -816,6 +1282,15 @@ export default function App() {
                   onClick={() => void stopRecording()}
                 >
                   Stop recording
+                </button>
+                <button
+                  type="button"
+                  className="link"
+                  data-testid="record-cancel"
+                  disabled={recording?.status !== "recording" || busy === "record-cancel"}
+                  onClick={() => void cancelRecording()}
+                >
+                  Cancel recording
                 </button>
               </div>
               {recording?.status === "recording" ? (
@@ -952,7 +1427,75 @@ export default function App() {
                   ? `Step ${guidance.stepIndex + 1}/${guidance.totalSteps}: ${guidance.instruction}`
                   : "No step highlighted yet."}
               </p>
-              {guidanceNote ? <p className="muted small">{guidanceNote}</p> : null}
+              {guidanceNote ? (
+                <p className="muted small" data-testid="guidance-note">
+                  {guidanceNote}
+                </p>
+              ) : null}
+              <p className="muted small" data-testid="guided-context">
+                Guided — Current browser tab · you act, the copilot highlights and checks.
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                data-testid="guidance-verify"
+                onClick={() => void verifyCurrentStep()}
+              >
+                Check this step
+              </button>
+              {stepCheck ? (
+                <p
+                  className={stepCheck.found && stepCheck.visible ? "outcome ok" : "outcome bad"}
+                  data-testid="guidance-verified"
+                >
+                  {stepCheck.found && stepCheck.visible
+                    ? "The recorded control is on the page and visible."
+                    : `Not observed in this tab (${stepCheck.reason}). The step is not confirmed.`}
+                </p>
+              ) : null}
+            </section>
+          ) : null}
+
+          {browserSession ? (
+            <section className="card">
+              <h2>Controlled browser session</h2>
+              <p className="muted small" data-testid="browser-session-id">
+                session {browserSession.id.slice(0, 8)} · {browserSession.sessionType} ·{" "}
+                {browserSession.applicationName}
+              </p>
+              <p className="small" data-testid="browser-session-target">
+                {browserSession.targetUrl}
+              </p>
+              <p
+                className={
+                  browserSession.status === "completed"
+                    ? "outcome ok"
+                    : browserSession.status === "running"
+                      ? "outcome warn"
+                      : "outcome bad"
+                }
+                data-testid="browser-session-status"
+              >
+                {browserSession.status}
+              </p>
+              {browserSession.summary ? (
+                <p className="small" data-testid="browser-session-summary">
+                  {browserSession.summary}
+                </p>
+              ) : null}
+              {browserSession.error ? (
+                <p className="alert bad" data-testid="browser-session-error">
+                  {browserSession.error}
+                </p>
+              ) : null}
+              <ol className="steps" data-testid="browser-session-actions">
+                {browserSession.actions.map((action, index) => (
+                  <li key={`${index}-${action}`}>
+                    <span className="idx">{index + 1}</span>
+                    <span>{action}</span>
+                  </li>
+                ))}
+              </ol>
             </section>
           ) : null}
         </>

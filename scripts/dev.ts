@@ -10,6 +10,11 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import { loadProjectEnv } from "@copilot/shared";
+
+// One `.env` for the whole stack: the children inherit this process's env, so
+// the API, the demo apps and the engines all read the same configuration.
+const env = loadProjectEnv();
 
 const tsxCli = path.resolve("node_modules/tsx/dist/cli.mjs");
 const children: ChildProcess[] = [];
@@ -39,6 +44,7 @@ setTimeout(() => {
     `\ndemo apps: ${process.env.DEMO_CRM_URL ?? "http://127.0.0.1:4300"}, ${process.env.DEMO_STOCK_URL ?? "http://127.0.0.1:4400"}`,
   );
   console.log(`api:       http://127.0.0.1:${process.env.PORT ?? 4000}`);
+  if (env.path) console.log(`env:       ${env.path} (${env.keys.length} keys)`);
 }, 1200);
 
 const shutdown = (): void => {

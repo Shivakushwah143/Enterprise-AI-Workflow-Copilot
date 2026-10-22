@@ -16,3 +16,8 @@ apps/demo/.data/
 research/OpenAdapt/
 .agents/
 .freebuff/
+.env.*
+!.env.example
+.venv*/
+**/node_modules/
+**/.output/

@@ -11,16 +11,18 @@
  * is the same UI Chrome shows in the side panel. Everything it reads comes from
  * http://127.0.0.1:4000, the API started by this script.
  */
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type BrowserContext, type Page } from "playwright";
 import { serve } from "@hono/node-server";
 import { KnowledgeEngine, Store, openDb } from "@copilot/knowledge";
 import { DEMO_APPS, inspectBundle, OpenAdaptEngine } from "@copilot/workflow";
-import type { VerificationContract } from "@copilot/shared";
+import { loadProjectEnv, type VerificationContract } from "@copilot/shared";
 import { createApp } from "../apps/api/src/app.js";
 import { seedDemo } from "../apps/api/src/seed-data.js";
 import { startAcmeDesk, startStockDesk } from "../apps/demo/src/apps.js";
+
+loadProjectEnv();
 
 const results: { name: string; ok: boolean; detail: string }[] = [];
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -54,17 +56,56 @@ async function newestBundle(): Promise<string | null> {
     } catch {
       continue;
     }
+    // The newest run has a bundle per application. This check drives AcmeDesk
+    // CRM, so pick the bundle whose steps are the customer workflow - taking the
+    // newest bundle blindly can hand the CRM skill StockDesk selectors.
     for (const entry of entries.filter((e) => e.endsWith("-bundle")).reverse()) {
       const bundle = path.join(recordings, entry);
       try {
         await readdir(bundle);
-        return bundle;
       } catch {
-        /* keep looking */
+        continue;
+      }
+      try {
+        const inspected = await inspectBundle(bundle);
+        const text = [
+          inspected.name,
+          ...inspected.steps.map((step) => `${step.intent} ${step.elementName ?? ""}`),
+        ]
+          .join(" ")
+          .toLowerCase();
+        if (text.includes("customer")) return bundle;
+      } catch {
+        /* an unreadable bundle is not a candidate */
       }
     }
   }
   return null;
+}
+
+/**
+ * The built extension is served to any page the user visits, so a credential in
+ * it is a credential published. WXT inlines only `WXT_`/`VITE_`-prefixed values,
+ * and this check proves that on the actual artifact rather than by assumption.
+ */
+async function scanBundleForSecrets(dir: string): Promise<string[]> {
+  const leaks: string[] = [];
+  const walk = async (current: string): Promise<void> => {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!/\.(js|mjs|json|html|css)$/.test(entry.name)) continue;
+      const text = await readFile(full, "utf8");
+      for (const pattern of [/gsk_[A-Za-z0-9]{10,}/, /GROQ_API_KEY/, /DATABASE_URL/, /postgres:\/\//]) {
+        if (pattern.test(text)) leaks.push(`${path.relative(dir, full)} matches ${pattern}`);
+      }
+    }
+  };
+  await walk(dir);
+  return leaks;
 }
 
 async function main(): Promise<number> {
@@ -74,6 +115,13 @@ async function main(): Promise<number> {
     console.error(`No built extension at ${extensionDir}. Run: pnpm build:extension`);
     return 2;
   }
+
+  const leaks = await scanBundleForSecrets(extensionDir);
+  check(
+    "the built extension contains no credentials or database URL",
+    leaks.length === 0,
+    leaks.length ? leaks.join("; ") : "scanned every bundled js/json/html file",
+  );
 
   await rm(runRoot, { recursive: true, force: true });
   await mkdir(runRoot, { recursive: true });
@@ -214,6 +262,28 @@ async function main(): Promise<number> {
 
     await panel.screenshot({ path: path.join(runRoot, "shots", "sidepanel-signed-in.png") });
 
+    // Execution mode is stated, and switching it is an explicit user action.
+    const defaultMode = await panel.inputValue('[data-testid="mode-select"]');
+    const defaultLabel = await panel.textContent('[data-testid="execution-mode"]');
+    check(
+      "the panel names the active execution mode and its browser context",
+      defaultMode === "autonomous" &&
+        (defaultLabel ?? "").includes("Autonomous") &&
+        (defaultLabel ?? "").includes("Controlled browser session"),
+      `mode=${defaultMode} label=${defaultLabel}`,
+    );
+    await panel.selectOption('[data-testid="mode-select"]', "guided");
+    const guidedLabel = await panel.textContent('[data-testid="execution-mode"]');
+    const guidedNote = await panel.textContent('[data-testid="execution-mode-detail"]');
+    check(
+      "guided mode says it uses the current tab and never claims to act",
+      (guidedLabel ?? "").includes("Guided") &&
+        (guidedLabel ?? "").includes("Current browser tab") &&
+        (guidedNote ?? "").includes("never acts for you"),
+      `label=${guidedLabel} detail=${(guidedNote ?? "").slice(0, 90)}`,
+    );
+    await panel.selectOption('[data-testid="mode-select"]', "autonomous");
+
     // The admin controls for "Learn my app": the real path is interactive, so
     // that must be the default and the parameter fields must be visible.
     if (skillId) {
@@ -231,11 +301,18 @@ async function main(): Promise<number> {
     /** Guidance is the only thing the content script does to the page. */
     if (skillId) {
       await panel.click('[data-testid="highlight-current"]');
-      await appPage.waitForFunction(
-        () => document.documentElement.dataset["copilotHighlighted"] === "#new-customer",
-        undefined,
-        { timeout: 20_000 },
-      );
+      try {
+        await appPage.waitForFunction(
+          () => document.documentElement.dataset["copilotHighlighted"] === "#new-customer",
+          undefined,
+          { timeout: 20_000 },
+        );
+      } catch (error) {
+        const note = await panel.textContent('[data-testid="guidance-note"]').catch(() => "");
+        throw new Error(
+          `the highlight did not reach the application tab; panel note: ${note ?? "none"} (${(error as Error).message.split("\n")[0]})`,
+        );
+      }
       const overlay = await appPage.locator(".driver-popover").count();
       const overlayText = overlay ? await appPage.textContent(".driver-popover") : "";
       check(
@@ -293,6 +370,29 @@ async function main(): Promise<number> {
         `dataset.copilotHighlighted=${String(highlightedAfterMiss)}`,
       );
       await appPage.goto(`${crm.baseUrl}/`, { waitUntil: "load" });
+
+      // Guided mode verifies the recorded control is really on the page. This
+      // is observation only: the content script never acts on the page.
+      await panel.selectOption('[data-testid="mode-select"]', "guided");
+      // Step 1 was the field that only exists after the form opens; return to
+      // the first recorded step, whose control is on the landing page.
+      await panel.click('[data-testid="guidance-prev"]');
+      await panel.click('[data-testid="highlight-current"]');
+      await appPage.waitForFunction(
+        () => document.documentElement.dataset["copilotHighlighted"] === "#new-customer",
+        undefined,
+        { timeout: 20_000 },
+      );
+      await panel.click('[data-testid="guidance-verify"]');
+      await panel.waitForSelector('[data-testid="guidance-verified"]', { timeout: 15_000 });
+      const verifiedText = await panel.textContent('[data-testid="guidance-verified"]');
+      check(
+        "guided mode verifies the recorded control in the page it is showing",
+        (verifiedText ?? "").includes("visible"),
+        `verify=\"${(verifiedText ?? "").slice(0, 90)}\"`,
+      );
+      await appPage.keyboard.press("Escape");
+      await panel.selectOption('[data-testid="mode-select"]', "autonomous");
     }
 
     /**
@@ -350,6 +450,32 @@ async function main(): Promise<number> {
         planSkill ?? "",
       );
 
+      // The pre-flight shows what the controlled session would do, before it
+      // runs: target, skill, inputs, requested actions, impact and session type.
+      const preflight = await panel.textContent('[data-testid="autonomous-preflight"]');
+      const sessionType = await panel.textContent('[data-testid="session-type"]');
+      const sessionActions = await panel.textContent('[data-testid="session-actions"]');
+      check(
+        "autonomous pre-flight names the target, skill, actions and session type",
+        (preflight ?? "").includes("Create customer") &&
+          (preflight ?? "").includes("AcmeDesk CRM") &&
+          (sessionType ?? "").includes("Controlled browser session") &&
+          (sessionType ?? "").includes("not your tab") &&
+          (sessionActions ?? "").length > 20,
+        `type=${(sessionType ?? "").slice(0, 60)} actions=${(sessionActions ?? "").slice(0, 60)}`,
+      );
+
+      // In guided mode the autonomous execute control is gone, not merely dimmed.
+      await panel.selectOption('[data-testid="mode-select"]', "guided");
+      const executeInGuided = await panel.locator('[data-testid="execute-button"]').count();
+      const stagehandInGuided = await panel.locator('[data-testid="stagehand-run"]').count();
+      check(
+        "guided mode offers no autonomous execution controls",
+        executeInGuided === 0 && stagehandInGuided === 0,
+        `executeButtons=${executeInGuided} stagehandButtons=${stagehandInGuided}`,
+      );
+      await panel.selectOption('[data-testid="mode-select"]', "autonomous");
+
       const outcome = await runFromPanel(
         `Create a customer named "Contoso Rail ${Date.now().toString().slice(-5)}" with contact ops@contoso.test`,
       );
@@ -367,6 +493,103 @@ async function main(): Promise<number> {
       const stepCount = await panel.locator('[data-testid="step-list"] li').count();
       check("panel lists the executed steps", stepCount > 0, `${stepCount} steps`);
       await panel.screenshot({ path: path.join(runRoot, "shots", "sidepanel-verified.png") });
+
+      // Closing and reopening the panel must not lose the operation.
+      await panel.reload({ waitUntil: "load" });
+      await panel.waitForSelector('[data-testid="execution-outcome"]', { timeout: 20_000 });
+      const restoredOutcome = await panel.textContent('[data-testid="execution-outcome"]');
+      const restoredPlan = await panel.locator('[data-testid="plan-skill"]').count();
+      check(
+        "reopening the panel restores the plan and the verified result from the API",
+        (restoredOutcome ?? "").trim() === "VERIFIED" && restoredPlan === 1,
+        `outcome=${(restoredOutcome ?? "").trim()} planVisible=${restoredPlan}`,
+      );
+
+      // Autonomous mode: a real controlled session with its own id, progress and
+      // terminal status. Started through the same API the panel calls, then the
+      // panel is reopened and must read that session back - the acceptance
+      // condition for "status survives reopening".
+      const login = (await (
+        await fetch(`${apiBase}/api/auth/login`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ tenantSlug: "acme-demo", email: "admin@acme.test" }),
+        })
+      ).json()) as { token: string };
+      const sessionStart = await fetch(`${apiBase}/api/stagehand/sessions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${login.token}`,
+        },
+        body: JSON.stringify({
+          url: `${crm.baseUrl}/`,
+          instruction: "open the new customer form",
+          approved: true,
+        }),
+      });
+      const sessionBody = (await sessionStart.json()) as {
+        id?: string;
+        status?: string;
+        sessionType?: string;
+        applicationName?: string;
+      };
+      check(
+        "a controlled browser session is created with an operation id and its target",
+        sessionStart.status === 202 &&
+          Boolean(sessionBody.id) &&
+          sessionBody.sessionType === "controlled_browser_session" &&
+          sessionBody.applicationName === "AcmeDesk CRM",
+        `HTTP ${sessionStart.status} id=${String(sessionBody.id).slice(0, 8)} type=${sessionBody.sessionType} app=${sessionBody.applicationName}`,
+      );
+
+      let sessionState = sessionBody as { status?: string; actions?: unknown[]; summary?: string };
+      const sessionDeadline = Date.now() + 120_000;
+      while (sessionState.status === "running" && Date.now() < sessionDeadline) {
+        await sleep(1500);
+        sessionState = (await fetch(`${apiBase}/api/stagehand/sessions/${sessionBody.id}`, {
+          headers: { authorization: `Bearer ${login.token}` },
+        }).then((r) => r.json())) as typeof sessionState;
+      }
+      check(
+        "the session reports its own progress and a real terminal status",
+        sessionState.status === "completed" && (sessionState.actions?.length ?? 0) > 0,
+        `status=${sessionState.status} actions=${sessionState.actions?.length} summary=${String(sessionState.summary ?? "").slice(0, 80)}`,
+      );
+
+      // Reopen the panel with that session as its workspace (what the panel's
+      // own start button persists) and read the status back from the API.
+      await panel.evaluate(async (sessionId: string) => {
+        const extensionChrome = (
+          globalThis as unknown as {
+            chrome: {
+              storage: { local: { set(items: Record<string, unknown>): Promise<void> } };
+            };
+          }
+        ).chrome;
+        await extensionChrome.storage.local.set({
+          "copilot.workspace": {
+            mode: "autonomous",
+            planResult: null,
+            executionId: null,
+            recordingId: null,
+            workflowId: null,
+            browserSessionId: sessionId,
+            applicationChoice: null,
+          },
+        });
+      }, sessionBody.id!);
+      await panel.reload({ waitUntil: "load" });
+      await panel.waitForSelector('[data-testid="browser-session-status"]', { timeout: 30_000 });
+      const sessionStatus = await panel.textContent('[data-testid="browser-session-status"]');
+      const sessionIdentity = await panel.textContent('[data-testid="browser-session-id"]');
+      check(
+        "the reopened panel shows the session's real terminal status and identity",
+        (sessionStatus ?? "").trim() === "completed" &&
+          (sessionIdentity ?? "").includes("controlled_browser_session"),
+        `status=${(sessionStatus ?? "").trim()} identity=${(sessionIdentity ?? "").slice(0, 70)}`,
+      );
+      await panel.screenshot({ path: path.join(runRoot, "shots", "sidepanel-autonomous.png") });
 
       // Negative path: the application rejects the write. The panel must FAIL.
       await fetch(`${crm.baseUrl}/api/faults`, {

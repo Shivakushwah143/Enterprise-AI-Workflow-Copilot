@@ -1,6 +1,8 @@
 export { openDb, maybeEnableVector, type Sql, type OpenDbOptions } from "./db.js";
 export {
   Store,
+  normalizeApplicationUrl,
+  type ApplicationResolution,
   type Tenant,
   type User,
   type SessionRow,

@@ -29,12 +29,30 @@ interface RecordingMessage {
   active?: boolean;
 }
 
-type CopilotMessage = HighlightMessage | ClearMessage | RecordingMessage;
+/**
+ * Guided mode: the employee performs the step, the panel asks the page whether
+ * the recorded control is actually there and visible. This is observation only -
+ * the content script still never clicks, types or reads form values.
+ */
+interface VerifyStepMessage {
+  type: "COPILOT_VERIFY_STEP";
+  selector?: string | null;
+}
+
+type CopilotMessage = HighlightMessage | ClearMessage | RecordingMessage | VerifyStepMessage;
 
 interface HighlightResponse {
   ok: boolean;
   highlighted: boolean;
   reason?: string;
+}
+
+interface VerifyStepResponse {
+  ok: boolean;
+  found: boolean;
+  visible: boolean;
+  reason: string;
+  url: string;
 }
 
 export default defineContentScript({
@@ -121,12 +139,44 @@ export default defineContentScript({
       return { ok: true, highlighted: true };
     }
 
+    function verifyStep(message: VerifyStepMessage): VerifyStepResponse {
+      const selector = (message.selector ?? "").trim();
+      const base = { ok: true, found: false, visible: false, url: location.href };
+      if (!selector) return { ...base, reason: "no-selector" };
+      let element: Element | null = null;
+      try {
+        element = document.querySelector(selector);
+      } catch {
+        return { ...base, ok: false, reason: "invalid-selector" };
+      }
+      if (!element) return { ...base, reason: "element-not-found" };
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      const visible =
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none" &&
+        Number(style.opacity) > 0;
+      return {
+        ok: true,
+        found: true,
+        visible,
+        reason: visible ? "control-present" : "control-hidden",
+        url: location.href,
+      };
+    }
+
     chrome.runtime.onMessage.addListener(
       (
         message: CopilotMessage,
         _sender: chrome.runtime.MessageSender,
-        sendResponse: (response: HighlightResponse | { ok: boolean }) => void,
+        sendResponse: (response: HighlightResponse | VerifyStepResponse | { ok: boolean }) => void,
       ) => {
+        if (message.type === "COPILOT_VERIFY_STEP") {
+          sendResponse(verifyStep(message));
+          return false;
+        }
         if (message.type === "COPILOT_HIGHLIGHT") {
           sendResponse(highlight(message));
           return false;

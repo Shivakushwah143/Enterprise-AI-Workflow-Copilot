@@ -15,7 +15,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Application, Skill, VerificationContract } from "@copilot/shared";
+import { envUrl, type Application, type Skill, type VerificationContract } from "@copilot/shared";
 import { KnowledgeEngine, Store, openDb, type Sql } from "@copilot/knowledge";
 import type {
   CompileRequest,
@@ -303,7 +303,12 @@ async function login(email: string, tenantSlug = "acme-demo"): Promise<Session> 
   return response.body;
 }
 
-async function waitForCompiled(token: string, recordingId: string, timeoutMs = 15_000) {
+// Compiling a recording is a database write plus a bundle read. On embedded
+// PostgreSQL that lands in well under a second; against a remote server (Neon)
+// the first one has been measured at 15.7s, so a 15s budget failed a pipeline
+// that was working. Wait long enough for the remote case; a genuinely stuck
+// recording still fails, just later.
+async function waitForCompiled(token: string, recordingId: string, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const { body } = await call<{
@@ -323,16 +328,32 @@ let application: Application;
 let workflowId: string;
 let skill: Skill;
 
+/**
+ * This suite tests policy, persistence and plumbing - not the provider. Model
+ * credentials are removed for its duration so a developer with a real key in
+ * `.env` gets the same deterministic results as CI, and so no test makes a
+ * network call. The provider itself is covered by the unit tests and by
+ * `pnpm check:groq`.
+ */
+const MODEL_KEYS = ["GROQ_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LLM_PROVIDER"];
+const savedModelEnv = new Map<string, string | undefined>();
+
 beforeAll(async () => {
+  for (const key of MODEL_KEYS) {
+    savedModelEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
   dir = await mkdtemp(path.join(tmpdir(), "copilot-integration-"));
   artifacts = path.join(dir, "artifacts");
   await mkdir(artifacts, { recursive: true });
   await startDemoApps(path.join(dir, "demo"));
 
-  // The same suite runs against Dockerized PostgreSQL when asked, which is how
-  // the pgvector path is exercised.
-  sql = process.env.TEST_DATABASE_URL
-    ? await openDb({ url: process.env.TEST_DATABASE_URL })
+  // The same suite runs against a real PostgreSQL when asked, which is how the
+  // pgvector path is exercised. A placeholder (`YOUR_...`) counts as unset:
+  // treating documentation as a URL would fail like an outage.
+  const testUrl = envUrl("TEST_DATABASE_URL");
+  sql = testUrl
+    ? await openDb({ url: testUrl })
     : await openDb({ dataDir: path.join(dir, "pg") });
   store = new Store(sql);
   knowledge = new KnowledgeEngine(store);
@@ -343,13 +364,22 @@ beforeAll(async () => {
   await store.ensureUser(tenant.id, "employee@acme.test", "Eve Employee", "employee");
   const otherTenant = await store.ensureTenant("other-tenant", "Other Tenant Inc");
   await store.ensureUser(otherTenant.id, "admin@other.test", "Otto Outsider", "admin");
-  application = await store.createApplication({
-    tenantId: tenant.id,
-    name: "AcmeDesk CRM",
-    baseUrl: `http://127.0.0.1:${CRM_PORT}`,
-    verificationBaseUrl: `http://127.0.0.1:${CRM_PORT}`,
-    kind: "browser",
-  });
+  // A remote test database keeps its rows between runs. Registering the same
+  // application again would give the tenant two rows with the same base URL, and
+  // `findApplicationForUrl` would resolve whichever came first - so `/api/context`
+  // would report the older row and none of this run's skills. Reuse it instead.
+  const existing = (await store.listApplications(tenant.id)).find(
+    (a) => a.name === "AcmeDesk CRM" && a.baseUrl === `http://127.0.0.1:${CRM_PORT}`,
+  );
+  application =
+    existing ??
+    (await store.createApplication({
+      tenantId: tenant.id,
+      name: "AcmeDesk CRM",
+      baseUrl: `http://127.0.0.1:${CRM_PORT}`,
+      verificationBaseUrl: `http://127.0.0.1:${CRM_PORT}`,
+      kind: "browser",
+    }));
   adminToken = (await login("admin@acme.test")).token;
   employeeToken = (await login("employee@acme.test")).token;
   outsiderToken = (await login("admin@other.test", "other-tenant")).token;
@@ -359,6 +389,10 @@ afterAll(async () => {
   await sql?.close();
   await stopDemoApps();
   await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  for (const [key, value] of savedModelEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe("authorization", () => {
@@ -577,7 +611,9 @@ describe("employee request -> plan -> guarded execution", () => {
 });
 
 describe("interactive Learn My App", () => {
-  it("keeps the session live until the admin stops it, then compiles a draft", async () => {
+  // This drives the real interactive recorder (headed Chromium). Against a remote
+  // test database the round-trips push it past the default 30s budget.
+  it("keeps the session live until the admin stops it, then compiles a draft", { timeout: 60_000 }, async () => {
     const started = await call<any>("POST", "/api/recordings", {
       token: adminToken,
       body: {
@@ -672,6 +708,170 @@ describe("extension-facing endpoints", () => {
     );
   });
 
+  it("refuses to choose between duplicate application rows, then accepts an explicit choice", async () => {
+    // A historical duplicate: same tenant, same identity, no rows merged. The
+    // API must not pick one for the user.
+    const duplicate = await store.createApplication({
+      tenantId: (await store.ensureTenant("acme-demo", "Acme Demo Corp")).id,
+      name: "AcmeDesk CRM",
+      baseUrl: `http://127.0.0.1:${CRM_PORT}`,
+    });
+    try {
+      const ambiguous = await call<any>(
+        "GET",
+        `/api/context?url=${encodeURIComponent(`http://127.0.0.1:${CRM_PORT}/`)}`,
+        { token: employeeToken },
+      );
+      expect(ambiguous.status).toBe(409);
+      expect(ambiguous.body.error.code).toBe("application_ambiguous");
+      const candidates = ambiguous.body.error.detail.candidates as { id: string }[];
+      expect(candidates.length).toBeGreaterThanOrEqual(2);
+
+      const chosen = await call<any>(
+        "GET",
+        `/api/context?url=${encodeURIComponent(
+          `http://127.0.0.1:${CRM_PORT}/`,
+        )}&applicationId=${application.id}`,
+        { token: employeeToken },
+      );
+      expect(chosen.status).toBe(200);
+      expect(chosen.body.applicationId).toBe(application.id);
+      expect(chosen.body.suggestedSkills.map((s: { name: string }) => s.name)).toContain(
+        "Create customer",
+      );
+
+      // A choice that names another tenant's row is not honoured.
+      const foreign = await call<any>(
+        "GET",
+        `/api/context?url=${encodeURIComponent(
+          `http://127.0.0.1:${CRM_PORT}/`,
+        )}&applicationId=${duplicate.id.replace(/[0-9a-f]/g, "0")}`,
+        { token: employeeToken },
+      );
+      expect(foreign.status).toBe(404);
+    } finally {
+      await sql.query("DELETE FROM applications WHERE id = $1", [duplicate.id]);
+    }
+  });
+
+  it("registers an application once per identity", async () => {
+    const first = await call<any>("POST", "/api/applications", {
+      token: adminToken,
+      body: { name: "Idempotent App", baseUrl: `http://127.0.0.1:${CRM_PORT}/` },
+    });
+    const second = await call<any>("POST", "/api/applications", {
+      token: adminToken,
+      body: { name: "Idempotent App", baseUrl: `http://127.0.0.1:${CRM_PORT}` },
+    });
+    expect([200, 201]).toContain(first.status);
+    expect([200, 201]).toContain(second.status);
+    expect(second.body.id).toBe(first.body.id);
+    expect(second.body.reused).toBe(true);
+  });
+
+  it("cancels only a live recording and refuses anything else", async () => {
+    const cancel = await call<any>("POST", "/api/recordings/no-such-recording/cancel", {
+      token: adminToken,
+      body: {},
+    });
+    expect(cancel.status).toBe(404);
+
+    const employeeCancel = await call<any>("POST", "/api/recordings/no-such-recording/cancel", {
+      token: employeeToken,
+      body: {},
+    });
+    expect(employeeCancel.status).toBe(403);
+  });
+
+  it("refuses a controlled browser session for an unregistered page", async () => {
+    const response = await call<any>("POST", "/api/stagehand/sessions", {
+      token: employeeToken,
+      body: {
+        url: "http://127.0.0.1:4999/unregistered",
+        instruction: "open the dashboard",
+        approved: true,
+      },
+    });
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("invalid_request");
+  });
+
+  it("never plans a skill from a different application than the page's", async () => {
+    const tenant = await store.ensureTenant("acme-demo", "Acme Demo Corp");
+    const stock = await store.createApplication({
+      tenantId: tenant.id,
+      name: "StockDesk",
+      baseUrl: `http://127.0.0.1:${Number(CRM_PORT) + 100}`,
+    });
+    const workflow = await store.createWorkflow({
+      tenantId: tenant.id,
+      applicationId: stock.id,
+      name: "Register stock item",
+      description: null,
+      bundlePath: null,
+      recordingId: null,
+      steps: [],
+      uncertainty: [],
+    });
+    await store.setWorkflowStatus(tenant.id, workflow.id, "approved");
+    const stockSkill = await store.createSkill({
+      tenantId: tenant.id,
+      workflowId: workflow.id,
+      name: "Register stock item",
+      description: "Registers stock in StockDesk",
+      requiredInputs: [],
+      triggeredBy: ["stock", "sku", "warehouse"],
+      verification: null,
+      approvedBy: "admin@acme.test",
+    });
+    try {
+      const unrestricted = await call<any>("POST", "/api/plans", {
+        token: employeeToken,
+        body: { intent: "Register stock item SKU-8842 with quantity 40" },
+      });
+      expect(unrestricted.body.plan.skillId).toBe(stockSkill.id);
+
+      const scoped = await call<any>("POST", "/api/plans", {
+        token: employeeToken,
+        body: {
+          intent: "Register stock item SKU-8842 with quantity 40",
+          applicationId: application.id,
+        },
+      });
+      expect(scoped.body.plan.skillId).not.toBe(stockSkill.id);
+
+      const foreign = await call<any>("POST", "/api/plans", {
+        token: employeeToken,
+        body: { intent: "Register stock item SKU-8842", applicationId: stock.id },
+      });
+      expect(foreign.status).toBe(200);
+    } finally {
+      await sql.query("DELETE FROM skills WHERE id = $1", [stockSkill.id]);
+      await sql.query("DELETE FROM workflows WHERE id = $1", [workflow.id]);
+      await sql.query("DELETE FROM applications WHERE id = $1", [stock.id]);
+    }
+  });
+
+  it("refuses a consequential AI session before opening a browser", async () => {
+    const response = await call<any>("POST", "/api/stagehand/sessions", {
+      token: employeeToken,
+      body: {
+        url: `http://127.0.0.1:${CRM_PORT}/`,
+        instruction: "delete every customer record",
+        approved: false,
+      },
+    });
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe("conflict");
+  });
+
+  it("does not reveal another tenant's browser session", async () => {
+    const response = await call<any>("GET", "/api/stagehand/sessions/00000000-0000-0000-0000-000000000000", {
+      token: outsiderToken,
+    });
+    expect(response.status).toBe(404);
+  });
+
   it("returns real guidance with a recorded selector, and never a guessed one", async () => {
     const first = await call<any>(
       "GET",
@@ -691,21 +891,35 @@ describe("extension-facing endpoints", () => {
     expect(missing.status).toBe(404);
   });
 
-  it("reports capability status honestly for an unconfigured environment", async () => {
+  it("reports capability status honestly for the environment it runs in", async () => {
     const response = await call<any>("GET", "/api/capabilities");
     expect(response.status).toBe(200);
-    expect(response.body.database.kind).toBe(
-      process.env.TEST_DATABASE_URL ? "postgres" : "pglite",
-    );
+    expect(response.body.database.kind).toBe(envUrl("TEST_DATABASE_URL") ? "postgres" : "pglite");
     expect(response.body.database.tenancyEnforced).toBe(true);
+    // Embeddings have no provider in this project yet, whatever else is set.
     expect(response.body.vectorSearch.status).not.toBe("configured");
+    // This suite runs with model credentials removed (see beforeAll), so the
+    // honest answer here is "unconfigured": it must not claim coverage.
     expect(response.body.llm.status).toBe("unconfigured");
+    expect(response.body.llm.provider).toBeNull();
+  });
+
+  it("labels a configured provider, without calling it", async () => {
+    process.env.GROQ_API_KEY = "gsk_unit_test_key_not_real";
+    try {
+      const response = await call<any>("GET", "/api/capabilities");
+      expect(response.body.llm.status).toBe("configured");
+      expect(response.body.llm.provider).toBe("groq");
+      expect(response.body.stagehand.status).toBe("configured");
+    } finally {
+      delete process.env.GROQ_API_KEY;
+    }
   });
 
   it("reports Stagehand as installed but unconfigured, not blocked", async () => {
     const response = await call<any>("GET", "/api/capabilities");
     expect(response.body.stagehand.status).toBe("unconfigured");
-    expect(response.body.stagehand.detail).toContain("OPENAI_API_KEY");
+    expect(response.body.stagehand.detail).toContain("GROQ_API_KEY");
   });
 
   it("refuses a consequential Stagehand instruction without approval", async () => {

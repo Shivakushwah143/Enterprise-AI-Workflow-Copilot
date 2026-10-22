@@ -26,6 +26,58 @@ import type {
 } from "@copilot/shared";
 import type { Sql } from "./db.js";
 
+/**
+ * Canonical form of an application's base URL.
+ *
+ * Identity is `scheme://host[:port][/path]`, so all of these describe one
+ * application: `http://127.0.0.1:4300`, `http://127.0.0.1:4300/`,
+ * `HTTP://127.0.0.1:4300//`, and `http://127.0.0.1:4300/?tab=home#top`.
+ * A different path is a different application (`/crm` vs `/stock`), and a
+ * different port is a different origin. Non-HTTP URLs have no application
+ * identity at all, so they normalize to null instead of a guess.
+ */
+export function normalizeApplicationUrl(raw: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(String(raw).trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (!url.hostname) return null;
+  const defaultPort =
+    (url.protocol === "http:" && url.port === "80") ||
+    (url.protocol === "https:" && url.port === "443");
+  const port = url.port && !defaultPort ? `:${url.port}` : "";
+  const pathname = url.pathname.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+  return `${url.protocol}//${url.hostname.toLowerCase()}${port}${pathname}`;
+}
+
+/**
+ * The resolver's answer. `ambiguous` is a refusal, not a tie-break: two rows
+ * with the same identity cannot both be "the" application, and picking one
+ * arbitrarily is how a skill ends up executing against the wrong record.
+ */
+export type ApplicationResolution =
+  | { status: "resolved"; application: Application; candidates: Application[] }
+  | { status: "ambiguous"; application: null; candidates: Application[] }
+  | { status: "none"; application: null; candidates: [] };
+
+/** Serializes registration per (tenant, identity) inside this process. */
+const registrationLocks = new Map<string, Promise<unknown>>();
+
+async function withRegistrationLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const previous = registrationLocks.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(run);
+  const guarded = next.catch(() => undefined);
+  registrationLocks.set(key, guarded);
+  try {
+    return await next;
+  } finally {
+    if (registrationLocks.get(key) === guarded) registrationLocks.delete(key);
+  }
+}
+
 export interface Tenant {
   id: string;
   slug: string;
@@ -297,6 +349,35 @@ export class Store {
     return app;
   }
 
+  /**
+   * Register once per (tenant, normalized base URL).
+   *
+   * Existing rows are returned untouched: duplicates are never merged or
+   * deleted here, because they may already carry workflows and audit records.
+   * Two concurrent registrations for the same identity serialize, so only one
+   * row is created. (A database unique index would be stronger, but it cannot
+   * be added while historical duplicates exist - see PHASE6_VALIDATION.md.)
+   */
+  async ensureApplication(input: {
+    tenantId: string;
+    name: string;
+    baseUrl: string;
+    verificationBaseUrl?: string | undefined;
+    kind?: "browser" | "desktop" | undefined;
+  }): Promise<{ application: Application; created: boolean }> {
+    const identity = normalizeApplicationUrl(input.baseUrl);
+    if (!identity) {
+      throw new Error(`"${input.baseUrl}" is not an http(s) URL, so it cannot identify an application.`);
+    }
+    return withRegistrationLock(`${input.tenantId}|${identity}`, async () => {
+      const existing = (await this.listApplications(input.tenantId)).find(
+        (app) => normalizeApplicationUrl(app.baseUrl) === identity,
+      );
+      if (existing) return { application: existing, created: false };
+      return { application: await this.createApplication(input), created: true };
+    });
+  }
+
   async listApplications(tenantId: string): Promise<Application[]> {
     const rows = await this.sql.query<Record<string, unknown>>(
       "SELECT * FROM applications WHERE tenant_id = $1 ORDER BY created_at",
@@ -318,13 +399,72 @@ export class Store {
     return all.find((a) => a.id === applicationId) ?? null;
   }
 
-  /** Resolve the application whose base URL is the longest prefix of `url`. */
+  /**
+   * Resolve a page URL to exactly one registered application of this tenant.
+   *
+   * Order of proof:
+   *   1. an exact normalized identity match wins - but if there is more than
+   *      one such row the answer is `ambiguous`, never "the oldest one";
+   *   2. otherwise the longest base *path* that contains the request on a
+   *      segment boundary wins (`/crm` matches `/crm/customers`, not `/crmx`),
+   *      and a tie at that length is again `ambiguous`;
+   *   3. anything else is `none`.
+   *
+   * Tenant scoping happens before matching: another tenant's row is not a
+   * candidate at all, so it can neither win nor influence ambiguity.
+   */
+  async resolveApplicationForUrl(
+    tenantId: string,
+    url: string,
+  ): Promise<ApplicationResolution> {
+    const normalized = normalizeApplicationUrl(url);
+    if (!normalized) return { status: "none", application: null, candidates: [] };
+
+    const apps = (await this.listApplications(tenantId)).map((application) => ({
+      application,
+      identity: normalizeApplicationUrl(application.baseUrl),
+    }));
+    const usable = apps.filter(
+      (entry): entry is { application: Application; identity: string } => entry.identity !== null,
+    );
+
+    const exact = usable.filter((entry) => entry.identity === normalized).map((e) => e.application);
+    if (exact.length === 1) {
+      return { status: "resolved", application: exact[0]!, candidates: exact };
+    }
+    if (exact.length > 1) return { status: "ambiguous", application: null, candidates: exact };
+
+    const request = new URL(normalized);
+    const requestPath = request.pathname;
+    const containing = usable.filter(({ identity }) => {
+      const base = new URL(identity);
+      // A prefix is only meaningful inside the same origin: a root-path app on
+      // another port is a different application, not the most general match.
+      if (base.origin !== request.origin) return false;
+      const basePath = base.pathname;
+      if (basePath === "" || basePath === "/") return true;
+      return requestPath === basePath || requestPath.startsWith(`${basePath}/`);
+    });
+    if (containing.length === 0) return { status: "none", application: null, candidates: [] };
+
+    const longest = Math.max(...containing.map(({ identity }) => new URL(identity).pathname.length));
+    const best = containing
+      .filter(({ identity }) => new URL(identity).pathname.length === longest)
+      .map((entry) => entry.application);
+    if (best.length === 1) {
+      return { status: "resolved", application: best[0]!, candidates: best };
+    }
+    return { status: "ambiguous", application: null, candidates: best };
+  }
+
+  /**
+   * @deprecated Lossy by design: an ambiguous URL has no single answer. Kept for
+   * callers that only need "is this page a known application"; use
+   * `resolveApplicationForUrl` when the chosen row matters.
+   */
   async findApplicationForUrl(tenantId: string, url: string): Promise<Application | null> {
-    const apps = await this.listApplications(tenantId);
-    const matches = apps
-      .filter((a) => url.startsWith(a.baseUrl))
-      .sort((a, b) => b.baseUrl.length - a.baseUrl.length);
-    return matches[0] ?? null;
+    const resolution = await this.resolveApplicationForUrl(tenantId, url);
+    return resolution.status === "resolved" ? resolution.application : null;
   }
 
   async upsertPage(
