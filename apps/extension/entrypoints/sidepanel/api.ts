@@ -118,11 +118,27 @@ export const api = {
     apiRequest<Execution>(config, "/api/executions", { method: "POST", body }),
   execution: (config: StoredConfig, id: string) =>
     apiRequest<Execution>(config, `/api/executions/${id}`),
-  startRecording: (config: StoredConfig, applicationId: string) =>
+  startRecording: (
+    config: StoredConfig,
+    applicationId: string,
+    options: {
+      mode: "interactive" | "scripted";
+      paramFields?: string[];
+      secretFields?: string[];
+      workflowName?: string;
+    },
+  ) =>
     apiRequest<RecordingResponse["recording"]>(config, "/api/recordings", {
       method: "POST",
-      body: { applicationId, mode: "scripted" },
+      body: { applicationId, ...options },
     }),
+  /** Ask a live interactive recording to finish; the browser flushes and compiles. */
+  stopRecording: (config: StoredConfig, recordingId: string) =>
+    apiRequest<RecordingResponse["recording"]>(
+      config,
+      `/api/recordings/${recordingId}/stop`,
+      { method: "POST", body: {} },
+    ),
   recording: (config: StoredConfig, id: string) =>
     apiRequest<RecordingResponse>(config, `/api/recordings/${id}`),
   approve: (

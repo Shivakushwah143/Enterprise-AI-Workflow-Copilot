@@ -116,8 +116,13 @@ export function extractInputs(
     if (name.includes("email") || name.includes("mail")) {
       value = emailMatch?.[0];
     } else if (/(quantity|qty|count|amount|number)/.test(name)) {
-      const number = intent.match(/-?\d+(?:\.\d+)?/);
-      value = number?.[0];
+      // A number next to the word "quantity" wins; a bare number that is part
+      // of an identifier (SKU-8842) must not be mistaken for the quantity.
+      const nearKeyword = intent.match(
+        /(?:quantity|qty|count|amount|number)\D{0,12}(-?\d+(?:\.\d+)?)/i,
+      );
+      const standalone = intent.match(/(?<![\w.-])\d+(?:\.\d+)?(?![\w.-])/);
+      value = nearKeyword?.[1] ?? standalone?.[0];
     } else if (/(sku|code|reference|ref)/.test(name)) {
       const code = intent.match(/\b[A-Z0-9]{2,}(?:-[A-Z0-9]{2,})+\b/);
       value = code?.[0];

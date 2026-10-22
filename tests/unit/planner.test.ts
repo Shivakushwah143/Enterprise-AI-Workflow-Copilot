@@ -92,6 +92,15 @@ describe("extractInputs", () => {
     expect(missing.map((m) => m.name)).toContain("api_token");
   });
 
+  it("does not read a quantity out of a SKU", () => {
+    const { inputs } = extractInputs('Register stock item "SKU-8842" with quantity 40', [
+      { name: "sku", label: "SKU", required: true, secret: false },
+      { name: "quantity", label: "Quantity", required: true, secret: false },
+    ]);
+    expect(inputs["sku"]).toBe("SKU-8842");
+    expect(inputs["quantity"]).toBe("40");
+  });
+
   it("honours explicit key: value pairs", () => {
     const { inputs } = extractInputs("do it with quantity: 42", [
       { name: "quantity", label: "Quantity", required: true, secret: false },

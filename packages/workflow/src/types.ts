@@ -69,6 +69,33 @@ export interface RecordRequest {
   headed?: boolean;
 }
 
+/**
+ * A human-driven recording. The engine opens a headed browser and keeps
+ * recording until `stop()` is called; the browser is the one the person uses.
+ */
+export interface InteractiveRecordRequest {
+  url: string;
+  outDir: string;
+  /** Field names whose typed values become replay parameters. */
+  paramFields?: string[];
+  /** Field names whose values must never be persisted. */
+  secretFields?: string[];
+  /**
+   * Optional built-in demonstration. When set, the engine drives its own
+   * browser for testing the pipeline; this is NOT a human recording and the
+   * result says so.
+   */
+  demoKey?: string;
+  timeoutMs?: number;
+}
+
+export interface InteractiveRecordingSession {
+  /** Resolves when the recorder has flushed and written the recording. */
+  result: Promise<EngineRecordingResult>;
+  /** Ask the recorder to finish now. Idempotent. */
+  stop(): Promise<void>;
+}
+
 export interface CompileRequest {
   recordingDir: string;
   bundleDir: string;
@@ -89,6 +116,9 @@ export interface WorkflowEngine {
   readonly kind: string;
   probe(): Promise<EngineProbe>;
   recordScripted(request: RecordRequest): Promise<EngineRecordingResult>;
+  recordInteractive(
+    request: InteractiveRecordRequest,
+  ): Promise<InteractiveRecordingSession>;
   compile(request: CompileRequest): Promise<EngineCompileResult>;
   replay(request: ReplayRequest): Promise<EngineReplayResult>;
 }

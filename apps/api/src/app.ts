@@ -22,7 +22,6 @@ import {
   type Guidance,
   type LandingPage,
   type Permission,
-  type Plan,
   type Skill,
   type Workflow,
 } from "@copilot/shared";
@@ -39,7 +38,7 @@ import {
 import { configuredEmbeddingProvider } from "@copilot/knowledge";
 import { inspectBundle, type WorkflowEngine } from "@copilot/workflow";
 import { createLogger, type Logger } from "./log.js";
-import { startRecording } from "./recordings.js";
+import { startRecording, stopInteractiveRecording } from "./recordings.js";
 import { runStagehandTask, stagehandStatus } from "./stagehand.js";
 
 export interface ApiDeps {
@@ -90,14 +89,6 @@ function toPublicExecution(row: ExecutionRow): Execution {
 export function createApp(deps: ApiDeps) {
   const logger = deps.log ?? log;
   const app = new Hono<Env>();
-  const plans = new Map<string, { plan: Plan; expiresAt: number }>();
-
-  const rememberPlan = (plan: Plan): void => {
-    plans.set(plan.id, { plan, expiresAt: Date.now() + 30 * 60_000 });
-    for (const [key, value] of plans) {
-      if (value.expiresAt < Date.now()) plans.delete(key);
-    }
-  };
 
   const publicRoutes = new Set(["POST /api/auth/login", "GET /api/health", "GET /api/capabilities"]);
 
@@ -306,6 +297,8 @@ export function createApp(deps: ApiDeps) {
         applicationId: body.applicationId,
         mode: body.mode,
         workflowName: body.workflowName,
+        paramFields: body.paramFields,
+        secretFields: body.secretFields,
       },
     );
     return c.json(
@@ -313,6 +306,31 @@ export function createApp(deps: ApiDeps) {
         ...recording,
         /** Visible recording indicator state for the extension. */
         recording: true,
+        /** For interactive recordings: the headed browser is now open. */
+        interactive: body.mode === "interactive",
+      },
+      202,
+    );
+  });
+
+  app.post("/api/recordings/:id/stop", async (c) => {
+    const session = c.get("session");
+    requirePermission(session, "application:write");
+    const recording = await stopInteractiveRecording(
+      {
+        store: deps.store,
+        engine: deps.engine,
+        artifactRoot: deps.artifactRoot,
+        log: logger,
+      },
+      session.tenant.id,
+      c.req.param("id"),
+    );
+    return c.json(
+      {
+        ...recording,
+        recording: recording.status === "recording",
+        stopping: true,
       },
       202,
     );
@@ -453,7 +471,7 @@ export function createApp(deps: ApiDeps) {
       resolution,
       contexts,
     });
-    rememberPlan(plan);
+    await deps.store.savePlan(plan);
     logger({
       event: "plan.created",
       planId: plan.id,
@@ -473,10 +491,11 @@ export function createApp(deps: ApiDeps) {
     });
   });
 
-  app.get("/api/plans/:id", (c) => {
-    const plan = plans.get(c.req.param("id"));
+  app.get("/api/plans/:id", async (c) => {
+    const session = c.get("session");
+    const plan = await deps.store.getPlan(session.tenant.id, c.req.param("id"));
     if (!plan) throw new CopilotError("not_found", "Plan not found or expired.", 404);
-    return c.json(plan.plan);
+    return c.json(plan);
   });
 
   /* ---------------- execution ---------------- */
@@ -485,9 +504,8 @@ export function createApp(deps: ApiDeps) {
     const session = c.get("session");
     requirePermission(session, "skill:execute");
     const body = ExecuteSchema.parse(await c.req.json());
-    const stored = plans.get(body.planId);
-    if (!stored) throw new CopilotError("not_found", "Plan not found or expired.", 404);
-    const plan = stored.plan;
+    const plan = await deps.store.getPlan(session.tenant.id, body.planId);
+    if (!plan) throw new CopilotError("not_found", "Plan not found or expired.", 404);
     if (plan.blockers.length > 0) {
       throw new CopilotError("conflict", plan.blockers.join(" "), 409, { blockers: plan.blockers });
     }
@@ -594,13 +612,19 @@ export function createApp(deps: ApiDeps) {
     const session = c.get("session");
     requirePermission(session, "skill:execute");
     const body = z
-      .object({ url: z.string().url(), instruction: z.string().min(4).max(500) })
+      .object({
+        url: z.string().url(),
+        instruction: z.string().min(4).max(500),
+        /** Required for consequential instructions; never inferred server-side. */
+        approved: z.boolean().default(false),
+      })
       .parse(await c.req.json());
     // Consequential language on an AI-driven session always needs approval, and
     // this route never approves on the caller's behalf.
     const result = await runStagehandTask({
       url: body.url,
       instruction: body.instruction,
+      approved: body.approved,
     });
     logger({
       event: "stagehand.task",

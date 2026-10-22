@@ -95,6 +95,9 @@ export default function App() {
   const [execution, setExecution] = useState<Execution | null>(null);
 
   const [recording, setRecording] = useState<Recording | null>(null);
+  const [recordMode, setRecordMode] = useState<"interactive" | "scripted">("interactive");
+  const [paramFields, setParamFields] = useState("company_name, email");
+  const [secretFields, setSecretFields] = useState("");
   const [draftWorkflow, setDraftWorkflow] = useState<Workflow | null>(null);
   const [verificationUrl, setVerificationUrl] = useState("");
   const [verificationRecordPath, setVerificationRecordPath] = useState("items");
@@ -269,10 +272,27 @@ export default function App() {
     setNotice(null);
     setBusy("record");
     setDraftWorkflow(null);
+    const fields = paramFields
+      .split(",")
+      .map((field) => field.trim())
+      .filter((field) => field.length > 0);
+    const secrets = secretFields
+      .split(",")
+      .map((field) => field.trim())
+      .filter((field) => field.length > 0);
     try {
-      const created = await api.startRecording(config, context.applicationId);
+      const created = await api.startRecording(config, context.applicationId, {
+        mode: recordMode,
+        paramFields: fields,
+        secretFields: secrets,
+      });
       setRecording(created);
       await sendToTab({ type: "COPILOT_RECORDING_INDICATOR", active: true });
+      setNotice(
+        recordMode === "interactive"
+          ? "A browser window opened. Perform the workflow there, then press Stop recording."
+          : "Running the application's built-in demonstration.",
+      );
       pollRecording(created.id);
     } catch (cause) {
       setError(messageOf(cause));
@@ -311,13 +331,24 @@ export default function App() {
   };
 
   const stopRecording = async (): Promise<void> => {
-    if (pollTimer.current !== null) window.clearTimeout(pollTimer.current);
-    pollTimer.current = null;
-    await sendToTab({ type: "COPILOT_RECORDING_INDICATOR", active: false });
-    setRecording((current) => (current ? { ...current, status: "cancelled" } : current));
-    setNotice(
-      "Recording indicator cleared. A server-side demonstration cannot be cancelled mid-run: it will finish and report its own result.",
-    );
+    if (!recording || recording.status !== "recording") {
+      setError("There is no recording in progress.");
+      return;
+    }
+    setError(null);
+    setBusy("record-stop");
+    try {
+      // The server finishes the browser session, flushes the events and then
+      // compiles; polling continues until the recording leaves `recording`.
+      await api.stopRecording(config, recording.id);
+      setNotice("Stopping the recording; the browser is flushing the last events.");
+      if (pollTimer.current !== null) window.clearTimeout(pollTimer.current);
+      pollRecording(recording.id);
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(null);
+    }
   };
 
   const approveWorkflow = async (): Promise<void> => {
@@ -740,6 +771,34 @@ export default function App() {
                 A demonstration is recorded, compiled into a workflow, and then
                 waits for your approval. Nothing executes until you approve it.
               </p>
+              <label htmlFor="record-mode">How should the demonstration run?</label>
+              <select
+                id="record-mode"
+                data-testid="record-mode"
+                value={recordMode}
+                onChange={(event) =>
+                  setRecordMode(event.target.value === "scripted" ? "scripted" : "interactive")
+                }
+              >
+                <option value="interactive">Interactive — I perform it in a browser</option>
+                <option value="scripted">Built-in demonstration (no human)</option>
+              </select>
+              <label htmlFor="record-param-fields">
+                Parameter fields (comma separated field names)
+              </label>
+              <input
+                id="record-param-fields"
+                data-testid="record-param-fields"
+                value={paramFields}
+                onChange={(event) => setParamFields(event.target.value)}
+              />
+              <label htmlFor="record-secret-fields">Secret fields (never persisted)</label>
+              <input
+                id="record-secret-fields"
+                data-testid="record-secret-fields"
+                value={secretFields}
+                onChange={(event) => setSecretFields(event.target.value)}
+              />
               <div className="row">
                 <button
                   type="button"
@@ -753,6 +812,7 @@ export default function App() {
                   type="button"
                   data-testid="record-stop"
                   className="secondary"
+                  disabled={recording?.status !== "recording" || busy === "record-stop"}
                   onClick={() => void stopRecording()}
                 >
                   Stop recording

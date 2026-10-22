@@ -1,6 +1,13 @@
 /**
  * Recording lifecycle: record -> compile -> ingest into the knowledge layer.
  *
+ * Two drivers, same artifacts:
+ *   - `interactive`: a headed browser is opened for the admin, who performs the
+ *     workflow; recording stops when the admin asks it to. This is the real
+ *     "learn my app" path.
+ *   - `scripted`: the application's built-in demonstration runs unattended
+ *     (useful for the demo apps and for CI).
+ *
  * A recording is always explicit, always attributed to a user, and always
  * leaves a row behind (including failures) so "Start Recording" can never look
  * like it silently did nothing. Compilation produces a DRAFT workflow: nothing
@@ -9,7 +16,12 @@
 import path from "node:path";
 import { CopilotError, type RecordingMode, type Workflow } from "@copilot/shared";
 import type { RecordingRow, Store } from "@copilot/knowledge";
-import { demoAppByUrl, inspectBundle, type WorkflowEngine } from "@copilot/workflow";
+import {
+  demoAppByUrl,
+  inspectBundle,
+  type InteractiveRecordingSession,
+  type WorkflowEngine,
+} from "@copilot/workflow";
 import type { Logger } from "./log.js";
 
 export interface RecordingDeps {
@@ -25,6 +37,19 @@ export interface StartRecordingInput {
   applicationId: string;
   mode: RecordingMode;
   workflowName?: string | undefined;
+  paramFields?: string[] | undefined;
+  secretFields?: string[] | undefined;
+}
+
+/**
+ * Interactive sessions that are currently recording. In-process on purpose:
+ * the browser process belongs to this API process, so a restart cannot resume
+ * it. A stop request for an unknown id is reported as a conflict, not success.
+ */
+const interactiveSessions = new Map<string, InteractiveRecordingSession>();
+
+export function isRecordingInProgress(recordingId: string): boolean {
+  return interactiveSessions.has(recordingId);
 }
 
 export function interactiveCommand(applicationUrl: string): string {
@@ -36,6 +61,15 @@ export function interactiveCommand(applicationUrl: string): string {
   ].join(" ");
 }
 
+interface Job {
+  recording: RecordingRow;
+  recordingDir: string;
+  applicationUrl: string;
+  applicationId: string;
+  workflowName: string;
+  tenantId: string;
+}
+
 export async function startRecording(
   deps: RecordingDeps,
   input: StartRecordingInput,
@@ -44,25 +78,19 @@ export async function startRecording(
   if (!application) {
     throw new CopilotError("not_found", "Application not found in this tenant.", 404);
   }
+  const demo = demoAppByUrl(application.baseUrl);
 
-  if (input.mode === "interactive") {
-    // We do not fake a human: the interactive recorder needs someone to drive a
-    // headed browser. The command is returned so the operator can run it.
+  if (input.mode === "scripted" && !demo) {
     throw new CopilotError(
       "capability_unavailable",
-      `Interactive recording requires a human at a headed browser. Run: ${interactiveCommand(
-        application.baseUrl,
-      )} (OpenAdapt's interactive recorder writes the same recording directory this API ingests).`,
+      "No demonstration script exists for this application. Record it interactively instead.",
       501,
-      { command: interactiveCommand(application.baseUrl) },
     );
   }
-
-  const demo = demoAppByUrl(application.baseUrl);
-  if (!demo) {
+  if (input.mode === "interactive" && application.kind !== "browser") {
     throw new CopilotError(
       "capability_unavailable",
-      "No demonstration script exists for this application. Add one to packages/workflow/python/copilot_bridge.py, or record it interactively.",
+      "Interactive browser recording needs a browser application.",
       501,
     );
   }
@@ -70,118 +98,210 @@ export async function startRecording(
   const recording = await deps.store.createRecording({
     tenantId: input.tenantId,
     applicationId: application.id,
-    mode: "scripted",
+    mode: input.mode,
     directory: path.join(deps.artifactRoot, "recordings", "pending"),
     createdBy: input.userId,
   });
-  // Point the row at its real directory as soon as the id exists.
   const recordingDir = path.join(deps.artifactRoot, "recordings", recording.id);
   await deps.store.sql.query(
     "UPDATE recordings SET directory = $3 WHERE tenant_id = $1 AND id = $2",
     [input.tenantId, recording.id, recordingDir],
   );
 
-  void run(deps, {
-    recording,
+  const job: Job = {
+    recording: { ...recording, directory: recordingDir },
     recordingDir,
     applicationUrl: application.baseUrl,
     applicationId: application.id,
-    appKey: demo.key,
-    workflowName: input.workflowName ?? demo.workflowName,
+    workflowName: input.workflowName ?? demo?.workflowName ?? `${application.name} workflow`,
     tenantId: input.tenantId,
-  });
+  };
 
-  return { ...recording, directory: recordingDir };
+  if (input.mode === "interactive") {
+    // Defaults come from the demonstration fixture when the admin did not name
+    // the fields: those are the fields the bundled demo types into.
+    const paramFields = input.paramFields?.length
+      ? input.paramFields
+      : (demo?.params.filter((p) => !p.secret).map((p) => p.name) ?? []);
+    const secretFields = input.secretFields?.length
+      ? input.secretFields
+      : (demo?.params.filter((p) => p.secret).map((p) => p.name) ?? []);
+
+    const session = await deps.engine.recordInteractive({
+      url: application.baseUrl,
+      outDir: recordingDir,
+      paramFields,
+      secretFields,
+    });
+    interactiveSessions.set(recording.id, session);
+    deps.log({
+      event: "recording.interactive_started",
+      recordingId: recording.id,
+      applicationId: application.id,
+      paramFields,
+      secretFields,
+    });
+    void finishInteractive(deps, job, session);
+    return job.recording;
+  }
+
+  void runScripted(deps, job, demo!.key);
+  return job.recording;
 }
 
-async function run(
+/**
+ * Ask an in-progress interactive recording to finish. The browser flushes its
+ * events and the recording is compiled; the caller polls `/recordings/:id`.
+ */
+export async function stopInteractiveRecording(
   deps: RecordingDeps,
-  job: {
-    recording: RecordingRow;
-    recordingDir: string;
-    applicationUrl: string;
-    applicationId: string;
-    appKey: string;
-    workflowName: string;
-    tenantId: string;
-  },
+  tenantId: string,
+  recordingId: string,
+): Promise<RecordingRow> {
+  const recording = await deps.store.getRecording(tenantId, recordingId);
+  if (!recording) throw new CopilotError("not_found", "Recording not found.", 404);
+  const session = interactiveSessions.get(recordingId);
+  if (!session) {
+    throw new CopilotError(
+      "conflict",
+      recording.status === "recording"
+        ? "This recording is no longer attached to a live browser session."
+        : `Recording is already ${recording.status}.`,
+      409,
+    );
+  }
+  await session.stop();
+  deps.log({ event: "recording.interactive_stop_requested", recordingId });
+  return recording;
+}
+
+async function finishInteractive(
+  deps: RecordingDeps,
+  job: Job,
+  session: InteractiveRecordingSession,
 ): Promise<void> {
-  const { store, engine, log } = deps;
-  const { recording, recordingDir, tenantId } = job;
   try {
-    const recorded = await engine.recordScripted({
-      appKey: job.appKey,
+    const recorded = await session.result;
+    if (!recorded.ok) {
+      throw new Error(recorded.error ?? "the interactive recording failed");
+    }
+    deps.log({
+      event: "recording.captured",
+      recordingId: job.recording.id,
+      mode: "interactive",
+      events: recorded.events,
+      frames: recorded.frames,
+    });
+    if (recorded.events === 0) {
+      throw new Error(
+        "The demonstration contained no recorded actions. Nothing was compiled; record again and perform the workflow in the browser.",
+      );
+    }
+    await compileAndIngest(deps, {
+      ...job,
+      workflowName: job.workflowName,
+    });
+  } catch (error) {
+    await fail(deps, job, error);
+  } finally {
+    interactiveSessions.delete(job.recording.id);
+  }
+}
+
+async function runScripted(deps: RecordingDeps, job: Job, appKey: string): Promise<void> {
+  try {
+    const recorded = await deps.engine.recordScripted({
+      appKey,
       url: job.applicationUrl,
-      outDir: recordingDir,
+      outDir: job.recordingDir,
     });
     if (!recorded.ok) {
       throw new Error(recorded.error ?? "recording failed");
     }
-    log({
+    deps.log({
       event: "recording.captured",
-      recordingId: recording.id,
+      recordingId: job.recording.id,
+      mode: "scripted",
       events: recorded.events,
       frames: recorded.frames,
     });
+    await compileAndIngest(deps, job);
+  } catch (error) {
+    await fail(deps, job, error);
+  }
+}
 
-    const bundleDir = path.join(path.dirname(recordingDir), `${recording.id}-bundle`);
-    const compiled = await engine.compile({
-      recordingDir,
-      bundleDir,
-      name: job.workflowName,
-    });
-    if (!compiled.ok) {
-      throw new Error(compiled.error ?? "compile failed");
-    }
+/** Compile a finished recording and ingest the resulting draft workflow. */
+async function compileAndIngest(deps: RecordingDeps, job: Job): Promise<void> {
+  const { store, engine, log } = deps;
+  const { recording, recordingDir, tenantId } = job;
 
-    const inspected = await inspectBundle(bundleDir);
-    const workflow: Workflow = await store.createWorkflow({
+  const bundleDir = path.join(path.dirname(recordingDir), `${recording.id}-bundle`);
+  const compiled = await engine.compile({
+    recordingDir,
+    bundleDir,
+    name: job.workflowName,
+  });
+  if (!compiled.ok) {
+    throw new Error(compiled.error ?? "compile failed");
+  }
+
+  const inspected = await inspectBundle(bundleDir);
+  const workflow: Workflow = await store.createWorkflow({
+    tenantId,
+    applicationId: job.applicationId,
+    name: inspected.name || job.workflowName,
+    description: `Learned from a demonstration of ${job.applicationUrl}.`,
+    bundlePath: bundleDir,
+    recordingId: recording.id,
+    steps: inspected.steps,
+    uncertainty: inspected.uncertainty,
+  });
+
+  // Populate the semantic model: page + identified elements.
+  const pageId = await store.upsertPage(tenantId, job.applicationId, "/", job.workflowName);
+  for (const step of inspected.steps) {
+    if (!step.selector && !step.elementName) continue;
+    await store.upsertElement({
       tenantId,
       applicationId: job.applicationId,
-      name: inspected.name || job.workflowName,
-      description: `Learned from a demonstration of ${job.applicationUrl}.`,
-      bundlePath: bundleDir,
-      recordingId: recording.id,
-      steps: inspected.steps,
-      uncertainty: inspected.uncertainty,
+      pageId,
+      semanticName:
+        step.elementName ?? step.fieldLabel ?? step.intent ?? `element-${step.index}`,
+      elementRole: step.elementRole,
+      selector: step.selector,
+      label: step.fieldLabel ?? step.ocrText,
+      state: { action: step.action, risk: step.risk },
+      confidence: step.confidence,
     });
-
-    // Populate the semantic model: page + identified elements.
-    const pageId = await store.upsertPage(tenantId, job.applicationId, "/", job.workflowName);
-    for (const step of inspected.steps) {
-      if (!step.selector && !step.elementName) continue;
-      await store.upsertElement({
-        tenantId,
-        applicationId: job.applicationId,
-        pageId,
-        semanticName:
-          step.elementName ?? step.fieldLabel ?? step.intent ?? `element-${step.index}`,
-        elementRole: step.elementRole,
-        selector: step.selector,
-        label: step.fieldLabel ?? step.ocrText,
-        state: { action: step.action, risk: step.risk },
-        confidence: step.confidence,
-      });
-    }
-
-    await store.updateRecording(tenantId, recording.id, {
-      status: "compiled",
-      workflowId: workflow.id,
-      finishedAt: new Date().toISOString(),
-    });
-    log({
-      event: "workflow.draft_created",
-      workflowId: workflow.id,
-      steps: workflow.steps.length,
-      uncertain: inspected.uncertainty.length,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown recording error";
-    await store.updateRecording(tenantId, recording.id, {
-      status: "failed",
-      error: message.slice(0, 2000),
-      finishedAt: new Date().toISOString(),
-    });
-    log({ event: "recording.failed", recordingId: recording.id, error: message });
   }
+
+  await store.updateRecording(tenantId, recording.id, {
+    status: "compiled",
+    workflowId: workflow.id,
+    finishedAt: new Date().toISOString(),
+  });
+  log({
+    event: "workflow.draft_created",
+    workflowId: workflow.id,
+    recordingId: recording.id,
+    mode: recording.mode,
+    steps: workflow.steps.length,
+    uncertain: inspected.uncertainty.length,
+  });
+}
+
+async function fail(deps: RecordingDeps, job: Job, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : "unknown recording error";
+  await deps.store.updateRecording(job.tenantId, job.recording.id, {
+    status: "failed",
+    error: message.slice(0, 2000),
+    finishedAt: new Date().toISOString(),
+  });
+  deps.log({
+    event: "recording.failed",
+    recordingId: job.recording.id,
+    mode: job.recording.mode,
+    error: message,
+  });
 }

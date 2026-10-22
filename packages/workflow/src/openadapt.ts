@@ -7,6 +7,7 @@
  */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -15,6 +16,8 @@ import type {
   EngineProbe,
   EngineRecordingResult,
   EngineReplayResult,
+  InteractiveRecordRequest,
+  InteractiveRecordingSession,
   RecordRequest,
   ReplayRequest,
   WorkflowEngine,
@@ -157,6 +160,62 @@ export class OpenAdaptEngine implements WorkflowEngine {
       error:
         (payload["error"] as string | undefined) ??
         (payload["ok"] ? undefined : `bridge failed: ${tail(out)}`),
+    };
+  }
+
+  /**
+   * Start a human-driven recording.
+   *
+   * The bridge opens a headed browser and records until the stop file appears;
+   * `stop()` creates it. No timeout is imposed on the person by default, but a
+   * runaway session is bounded so a crashed API cannot leave a browser open
+   * forever.
+   */
+  async recordInteractive(
+    request: InteractiveRecordRequest,
+  ): Promise<InteractiveRecordingSession> {
+    const stopFile = path.join(
+      path.dirname(request.outDir),
+      `${path.basename(request.outDir)}.stop`,
+    );
+    await rm(stopFile, { force: true });
+
+    const args = [
+      "record-interactive",
+      "--url",
+      request.url,
+      "--out",
+      request.outDir,
+      "--stop-file",
+      stopFile,
+    ];
+    for (const field of request.paramFields ?? []) args.push("--param", field);
+    for (const field of request.secretFields ?? []) args.push("--secret", field);
+    if (request.demoKey) args.push("--demo", request.demoKey);
+
+    const running = runBridge(args, request.timeoutMs ?? 45 * 60_000);
+    const result = running.then((out): EngineRecordingResult => {
+      const payload = out.payload ?? {};
+      return {
+        ok: Boolean(payload["ok"]),
+        recordingDir: String(payload["recording_dir"] ?? request.outDir),
+        title: payload["title"] as string | undefined,
+        events: Number(payload["events"] ?? 0),
+        frames: Number(payload["frames"] ?? 0),
+        error: out.timedOut
+          ? "record-interactive timed out before the recording was stopped"
+          : ((payload["error"] as string | undefined) ??
+            (payload["ok"]
+              ? undefined
+              : `record-interactive failed: ${tail(out)}`)),
+      };
+    });
+
+    return {
+      result,
+      stop: async () => {
+        await writeFile(stopFile, new Date().toISOString(), "utf8");
+      },
     };
   }
 

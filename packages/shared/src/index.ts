@@ -233,9 +233,16 @@ export type Recording = z.infer<typeof RecordingSchema>;
 
 export const StartRecordingSchema = z.object({
   applicationId: z.string().min(1),
-  /** Only the scripted driver can be started without a human at the keyboard. */
+  /**
+   * `interactive` opens a headed browser for the admin to demonstrate in;
+   * `scripted` replays the app's built-in demonstration (no human needed).
+   */
   mode: RecordingModeSchema.default("interactive"),
   workflowName: z.string().min(2).max(120).optional(),
+  /** Field names whose typed values become replay parameters. */
+  paramFields: z.array(z.string().min(1)).max(20).default([]),
+  /** Field names whose values are never persisted. */
+  secretFields: z.array(z.string().min(1)).max(20).default([]),
 });
 
 /* ------------------------------------------------------------------ */

@@ -214,6 +214,87 @@ async function main(): Promise<number> {
 
     await panel.screenshot({ path: path.join(runRoot, "shots", "sidepanel-signed-in.png") });
 
+    // The admin controls for "Learn my app": the real path is interactive, so
+    // that must be the default and the parameter fields must be visible.
+    if (skillId) {
+      const mode = await panel.inputValue('[data-testid="record-mode"]');
+      const paramFields = await panel.inputValue('[data-testid="record-param-fields"]');
+      const startEnabled = await panel.isEnabled('[data-testid="record-start"]');
+      const stopEnabled = await panel.isEnabled('[data-testid="record-stop"]');
+      check(
+        "the admin panel offers interactive recording with parameter fields",
+        mode === "interactive" && paramFields.includes("company_name") && startEnabled && !stopEnabled,
+        `mode=${mode} paramFields="${paramFields}" start=${startEnabled} stop=${stopEnabled}`,
+      );
+    }
+
+    /** Guidance is the only thing the content script does to the page. */
+    if (skillId) {
+      await panel.click('[data-testid="highlight-current"]');
+      await appPage.waitForFunction(
+        () => document.documentElement.dataset["copilotHighlighted"] === "#new-customer",
+        undefined,
+        { timeout: 20_000 },
+      );
+      const overlay = await appPage.locator(".driver-popover").count();
+      const overlayText = overlay ? await appPage.textContent(".driver-popover") : "";
+      check(
+        "Driver.js highlights the recorded control in the application tab",
+        overlay > 0 && (overlayText ?? "").includes("New customer"),
+        `overlays=${overlay} text=${(overlayText ?? "").slice(0, 80)}`,
+      );
+      await appPage.screenshot({ path: path.join(runRoot, "shots", "app-highlighted.png") });
+
+      // Escape must dismiss the overlay so the application stays usable.
+      await appPage.keyboard.press("Escape");
+      await appPage.waitForFunction(
+        () => document.querySelectorAll(".driver-popover").length === 0,
+        undefined,
+        { timeout: 10_000 },
+      );
+      const stillBlocked = await appPage.locator(".driver-overlay").count();
+      check(
+        "the overlay can be dismissed, so application controls stay usable",
+        stillBlocked === 0,
+        `overlay elements after Escape: ${stillBlocked}`,
+      );
+
+      // A changed page state: open the form, then highlight the field that only
+      // exists after that click.
+      await appPage.click("#new-customer");
+      await panel.click('[data-testid="guidance-next"]');
+      await appPage.waitForFunction(
+        () => document.documentElement.dataset["copilotHighlighted"] === "#customer-name",
+        undefined,
+        { timeout: 20_000 },
+      );
+      check(
+        "guidance follows a page state that changed after the recording",
+        true,
+        "highlighted #customer-name after the form opened",
+      );
+      await appPage.keyboard.press("Escape");
+
+      // A selector that is absent from this page must be reported, never
+      // approximated with coordinates.
+      await appPage.goto(`${DEMO_APPS[1]!.baseUrl}/`);
+      await panel.click('[data-testid="highlight-current"]');
+      await panel.waitForFunction(
+        () => document.body.textContent?.includes("Could not highlight") === true,
+        undefined,
+        { timeout: 20_000 },
+      );
+      const highlightedAfterMiss = await appPage.evaluate(
+        () => document.documentElement.dataset["copilotHighlighted"] ?? null,
+      );
+      check(
+        "a missing control is reported instead of highlighted",
+        highlightedAfterMiss === null,
+        `dataset.copilotHighlighted=${String(highlightedAfterMiss)}`,
+      );
+      await appPage.goto(`${crm.baseUrl}/`, { waitUntil: "load" });
+    }
+
     /**
      * Plan, approve and execute from the panel, waiting on the API responses
      * rather than on element presence: a previous plan's elements are still on

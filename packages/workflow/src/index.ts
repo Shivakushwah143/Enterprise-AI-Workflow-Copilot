@@ -6,6 +6,8 @@ export type {
   EngineReplayResult,
   EngineStepResult,
   RecordRequest,
+  InteractiveRecordRequest,
+  InteractiveRecordingSession,
   CompileRequest,
   ReplayRequest,
 } from "./types.js";

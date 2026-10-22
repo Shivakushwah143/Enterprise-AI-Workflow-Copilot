@@ -44,6 +44,20 @@ let app: ReturnType<typeof createApp>;
  * copy of it.
  */
 async function startDemoApps(dataDir: string): Promise<void> {
+  // Refuse to run against a server this test did not start: a leftover demo
+  // app keeps its own database, and a "fresh" run would silently verify
+  // against stale records.
+  try {
+    const existing = await fetch(`http://127.0.0.1:${CRM_PORT}/api/status`);
+    if (existing.ok) {
+      throw new Error(
+        `port ${CRM_PORT} is already serving a demo application; stop it before running the integration suite`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("already serving")) throw error;
+    // Connection refused is the expected path.
+  }
   const tsxCli = path.resolve("node_modules/tsx/dist/cli.mjs");
   demoApps = spawn(process.execPath, [tsxCli, "apps/demo/src/main.ts"], {
     env: {
@@ -68,10 +82,21 @@ async function startDemoApps(dataDir: string): Promise<void> {
   throw new Error("the demo applications did not start in time");
 }
 
-function stopDemoApps(): void {
+async function stopDemoApps(): Promise<void> {
   if (!demoApps) return;
-  demoApps.kill();
+  const child = demoApps;
   demoApps = null;
+  child.kill();
+  if (child.exitCode !== null) return;
+  // Wait for the process to release its SQLite files before the temp directory
+  // is deleted; on Windows an ORPHANED server keeps acme.db locked (EBUSY).
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 5_000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 /** The engine's vertical: "write" performs the business action, "claim" lies. */
@@ -143,6 +168,28 @@ const fakeEngine: WorkflowEngine = {
     await mkdir(recordingDir, { recursive: true });
     await writeFile(path.join(recordingDir, "events.jsonl"), "{}\n", "utf8");
     return { ok: true, recordingDir, title: "Create customer", events: 1, frames: 1 };
+  },
+  async recordInteractive(request) {
+    // Stand-in for a headed recorder: the API considers the session live until
+    // `stop()` resolves it, exactly like the real bridge waiting for the admin.
+    await mkdir(request.outDir, { recursive: true });
+    await writeFile(path.join(request.outDir, "events.jsonl"), "{}\n", "utf8");
+    let finish: (value: EngineRecordingResult) => void = () => {};
+    const result = new Promise<EngineRecordingResult>((resolve) => {
+      finish = resolve;
+    });
+    return {
+      result,
+      stop: async () => {
+        finish({
+          ok: true,
+          recordingDir: request.outDir,
+          title: "Interactive recording",
+          events: 1,
+          frames: 1,
+        });
+      },
+    };
   },
   async compile(request: CompileRequest): Promise<EngineCompileResult> {
     await mkdir(request.bundleDir, { recursive: true });
@@ -260,7 +307,7 @@ async function waitForCompiled(token: string, recordingId: string, timeoutMs = 1
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const { body } = await call<{
-      recording: { status: string; error: string | null };
+      recording: { status: string; error: string | null; mode: string };
       workflow: any;
     }>("GET", `/api/recordings/${recordingId}`, { token });
     if (body.recording.status !== "recording") return body;
@@ -271,6 +318,7 @@ async function waitForCompiled(token: string, recordingId: string, timeoutMs = 1
 
 let adminToken: string;
 let employeeToken: string;
+let outsiderToken: string;
 let application: Application;
 let workflowId: string;
 let skill: Skill;
@@ -281,7 +329,11 @@ beforeAll(async () => {
   await mkdir(artifacts, { recursive: true });
   await startDemoApps(path.join(dir, "demo"));
 
-  sql = await openDb({ dataDir: path.join(dir, "pg") });
+  // The same suite runs against Dockerized PostgreSQL when asked, which is how
+  // the pgvector path is exercised.
+  sql = process.env.TEST_DATABASE_URL
+    ? await openDb({ url: process.env.TEST_DATABASE_URL })
+    : await openDb({ dataDir: path.join(dir, "pg") });
   store = new Store(sql);
   knowledge = new KnowledgeEngine(store);
   app = createApp({ store, engine: fakeEngine, knowledge, artifactRoot: artifacts });
@@ -289,6 +341,8 @@ beforeAll(async () => {
   const tenant = await store.ensureTenant("acme-demo", "Acme Demo Corp");
   await store.ensureUser(tenant.id, "admin@acme.test", "Ada Admin", "admin");
   await store.ensureUser(tenant.id, "employee@acme.test", "Eve Employee", "employee");
+  const otherTenant = await store.ensureTenant("other-tenant", "Other Tenant Inc");
+  await store.ensureUser(otherTenant.id, "admin@other.test", "Otto Outsider", "admin");
   application = await store.createApplication({
     tenantId: tenant.id,
     name: "AcmeDesk CRM",
@@ -298,12 +352,13 @@ beforeAll(async () => {
   });
   adminToken = (await login("admin@acme.test")).token;
   employeeToken = (await login("employee@acme.test")).token;
+  outsiderToken = (await login("admin@other.test", "other-tenant")).token;
 });
 
 afterAll(async () => {
   await sql?.close();
-  stopDemoApps();
-  await rm(dir, { recursive: true, force: true });
+  await stopDemoApps();
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 describe("authorization", () => {
@@ -521,6 +576,88 @@ describe("employee request -> plan -> guarded execution", () => {
   });
 });
 
+describe("interactive Learn My App", () => {
+  it("keeps the session live until the admin stops it, then compiles a draft", async () => {
+    const started = await call<any>("POST", "/api/recordings", {
+      token: adminToken,
+      body: {
+        applicationId: application.id,
+        mode: "interactive",
+        paramFields: ["company_name", "email"],
+      },
+    });
+    expect(started.status).toBe(202);
+    expect(started.body.mode).toBe("interactive");
+    expect(started.body.interactive).toBe(true);
+
+    const live = await call<any>("GET", `/api/recordings/${started.body.id}`, {
+      token: adminToken,
+    });
+    expect(live.body.recording.status).toBe("recording");
+
+    const stopped = await call<any>("POST", `/api/recordings/${started.body.id}/stop`, {
+      token: adminToken,
+      body: {},
+    });
+    expect(stopped.status).toBe(202);
+    expect(stopped.body.stopping).toBe(true);
+
+    const finished = await waitForCompiled(adminToken, started.body.id);
+    expect(finished.recording.status).toBe("compiled");
+    expect(finished.recording.mode).toBe("interactive");
+    expect(finished.workflow.status).toBe("draft");
+    expect(finished.workflow.steps).toHaveLength(BUNDLE_STEPS.length);
+  });
+
+  it("reports a stop for a recording that is not live", async () => {
+    const response = await call<any>("POST", "/api/recordings/does-not-exist/stop", {
+      token: adminToken,
+      body: {},
+    });
+    expect(response.status).toBe(404);
+  });
+
+  it("persists plans and scopes them to the tenant that created them", async () => {
+    const created = await call<any>("POST", "/api/plans", {
+      token: employeeToken,
+      body: { intent: "create a customer named Persisted Plan Ltd" },
+    });
+    expect(created.status).toBe(200);
+    const planId = created.body.plan.id;
+
+    // The same token, after a fresh API instance, can still read the plan.
+    const sameTenant = await call<any>("GET", `/api/plans/${planId}`, {
+      token: employeeToken,
+    });
+    expect(sameTenant.status).toBe(200);
+    expect(sameTenant.body.id).toBe(planId);
+
+    const otherTenant = await call<any>("GET", `/api/plans/${planId}`, {
+      token: outsiderToken,
+    });
+    expect(otherTenant.status).toBe(404);
+
+    const execute = await call<any>("POST", "/api/executions", {
+      token: outsiderToken,
+      body: { planId, inputs: {}, approved: true },
+    });
+    expect(execute.status).toBe(404);
+  });
+
+  it("keeps recording controls to admins", async () => {
+    const start = await call<any>("POST", "/api/recordings", {
+      token: employeeToken,
+      body: { applicationId: application.id, mode: "interactive" },
+    });
+    expect(start.status).toBe(403);
+    const stop = await call<any>("POST", "/api/recordings/any/stop", {
+      token: employeeToken,
+      body: {},
+    });
+    expect(stop.status).toBe(403);
+  });
+});
+
 describe("extension-facing endpoints", () => {
   it("reports the application and suggested skills for a landing page", async () => {
     const response = await call<any>(
@@ -557,10 +694,41 @@ describe("extension-facing endpoints", () => {
   it("reports capability status honestly for an unconfigured environment", async () => {
     const response = await call<any>("GET", "/api/capabilities");
     expect(response.status).toBe(200);
-    expect(response.body.database.kind).toBe("pglite");
+    expect(response.body.database.kind).toBe(
+      process.env.TEST_DATABASE_URL ? "postgres" : "pglite",
+    );
     expect(response.body.database.tenancyEnforced).toBe(true);
     expect(response.body.vectorSearch.status).not.toBe("configured");
     expect(response.body.llm.status).toBe("unconfigured");
+  });
+
+  it("reports Stagehand as installed but unconfigured, not blocked", async () => {
+    const response = await call<any>("GET", "/api/capabilities");
+    expect(response.body.stagehand.status).toBe("unconfigured");
+    expect(response.body.stagehand.detail).toContain("OPENAI_API_KEY");
+  });
+
+  it("refuses a consequential Stagehand instruction without approval", async () => {
+    const refused = await call<any>("POST", "/api/stagehand/tasks", {
+      token: adminToken,
+      body: {
+        url: `http://127.0.0.1:${CRM_PORT}/`,
+        instruction: "delete every customer record",
+      },
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error.message).toContain("approved: true");
+
+    const approved = await call<any>("POST", "/api/stagehand/tasks", {
+      token: adminToken,
+      body: {
+        url: `http://127.0.0.1:${CRM_PORT}/`,
+        instruction: "delete every customer record",
+        approved: true,
+      },
+    });
+    // Approved, but no model credentials in this environment: blocked, never faked.
+    expect(approved.status).toBe(503);
   });
 
   it("returns execution history for the extension to display", async () => {

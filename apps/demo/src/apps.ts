@@ -16,7 +16,23 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-export type FaultMode = "none" | "reject-create";
+/**
+ * Fault injection for the demonstration apps.
+ *
+ * `reject-create` refuses the write; `missing-control` serves the same page
+ * with the save control removed, which is what "the UI changed and the button
+ * is gone" looks like to a replay.
+ */
+export type FaultMode = "none" | "reject-create" | "missing-control";
+
+const ACME_SAVE_BUTTON =
+  '<button id="save-customer" class="primary" type="submit">Save customer</button>';
+const STOCK_SAVE_BUTTON =
+  '<button id="save-item" class="act" type="submit">Register item</button>';
+
+function withMissingControl(page: string, button: string, replacement: string): string {
+  return page.replace(button, replacement);
+}
 
 export interface AppHandle {
   close(): Promise<void>;
@@ -176,7 +192,9 @@ export async function startAcmeDesk(options: {
     const row = db.prepare("SELECT mode FROM faults WHERE id = 1").get() as
       | { mode: string }
       | undefined;
-    return row?.mode === "reject-create" ? "reject-create" : "none";
+    if (row?.mode === "reject-create") return "reject-create";
+    if (row?.mode === "missing-control") return "missing-control";
+    return "none";
   };
 
   const server: Server = createServer(async (req, res) => {
@@ -184,7 +202,19 @@ export async function startAcmeDesk(options: {
     const route = `${req.method} ${url.pathname}`;
 
     try {
-      if (route === "GET /") return html(res, ACME_HTML);
+      if (route === "GET /") {
+        if (getFault() === "missing-control") {
+          return html(
+            res,
+            withMissingControl(
+              ACME_HTML,
+              ACME_SAVE_BUTTON,
+              '<p id="save-unavailable">Saving is temporarily unavailable.</p>',
+            ),
+          );
+        }
+        return html(res, ACME_HTML);
+      }
 
       if (route === "GET /api/customers") {
         const name = (url.searchParams.get("name") ?? "").trim();
@@ -255,7 +285,12 @@ export async function startAcmeDesk(options: {
 
       if (route === "POST /api/faults") {
         const body = await readJson(req);
-        const mode = body["mode"] === "reject-create" ? "reject-create" : "none";
+        const mode =
+          body["mode"] === "reject-create"
+            ? "reject-create"
+            : body["mode"] === "missing-control"
+              ? "missing-control"
+              : "none";
         db.prepare("UPDATE faults SET mode = ? WHERE id = 1").run(mode);
         return json(res, 200, { mode });
       }
@@ -396,14 +431,28 @@ export async function startStockDesk(options: {
     const row = db.prepare("SELECT mode FROM faults WHERE id = 1").get() as
       | { mode: string }
       | undefined;
-    return row?.mode === "reject-create" ? "reject-create" : "none";
+    if (row?.mode === "reject-create") return "reject-create";
+    if (row?.mode === "missing-control") return "missing-control";
+    return "none";
   };
 
   const server: Server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const route = `${req.method} ${url.pathname}`;
     try {
-      if (route === "GET /") return html(res, STOCK_HTML);
+      if (route === "GET /") {
+        if (getFault() === "missing-control") {
+          return html(
+            res,
+            withMissingControl(
+              STOCK_HTML,
+              STOCK_SAVE_BUTTON,
+              '<p id="save-unavailable">Registration is temporarily unavailable.</p>',
+            ),
+          );
+        }
+        return html(res, STOCK_HTML);
+      }
 
       if (route === "GET /api/items") {
         const sku = (url.searchParams.get("sku") ?? "").trim();
@@ -449,7 +498,12 @@ export async function startStockDesk(options: {
 
       if (route === "POST /api/faults") {
         const body = await readJson(req);
-        const mode = body["mode"] === "reject-create" ? "reject-create" : "none";
+        const mode =
+          body["mode"] === "reject-create"
+            ? "reject-create"
+            : body["mode"] === "missing-control"
+              ? "missing-control"
+              : "none";
         db.prepare("UPDATE faults SET mode = ? WHERE id = 1").run(mode);
         return json(res, 200, { mode });
       }

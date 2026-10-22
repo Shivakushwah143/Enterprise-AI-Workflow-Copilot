@@ -184,6 +184,83 @@ def cmd_record_scripted(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _demo_script(app_key: str):
+    """Drive the recorder's OWN browser through a demonstration.
+
+    This exists so the interactive pipeline (listener -> frames -> finish ->
+    compile) can be exercised in CI. Playwright drives the browser instead of a
+    person, so the bridge reports the driver as ``synthetic`` and never claims a
+    human demonstration took place.
+    """
+    spec = DEMONSTRATIONS[app_key]
+
+    def drive(page: Any, pump: Any) -> None:
+        def click(selector: str) -> None:
+            page.wait_for_selector(selector, state="visible", timeout=20000)
+            page.click(selector)
+            pump()
+            pump()
+
+        for kind, selector, extra in spec["steps"]:
+            if kind == "click":
+                assert selector is not None
+                click(selector)
+            else:
+                assert extra is not None
+                page.keyboard.type(str(extra["value"]))
+                pump()
+                pump()
+
+    return drive
+
+
+def cmd_record_interactive(args: argparse.Namespace) -> dict[str, Any]:
+    """Human-driven recording: headed browser, stop when the stop file appears."""
+    from openadapt_flow.interactive_recorder import record_interactive
+
+    out_dir = Path(args.out)
+    if out_dir.exists():
+        import shutil
+
+        shutil.rmtree(out_dir)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    stop_file = Path(args.stop_file)
+    if stop_file.exists():
+        stop_file.unlink()
+
+    script = _demo_script(args.demo) if args.demo else None
+    kwargs: dict[str, Any] = {}
+    if script is None:
+        kwargs["stop_when"] = lambda: stop_file.exists()
+
+    recording = record_interactive(
+        args.url,
+        out_dir,
+        param_fields=tuple(args.param or ()),
+        secret_fields=tuple(args.secret or ()),
+        headless=args.headless,
+        script=script,
+        **kwargs,
+    )
+
+    events_path = Path(recording) / "events.jsonl"
+    events = (
+        events_path.read_text(encoding="utf-8").strip().splitlines()
+        if events_path.exists()
+        else []
+    )
+    frames = list((Path(recording) / "frames").glob("*.png"))
+    return {
+        "ok": True,
+        "recording_dir": str(recording),
+        "events": len(events),
+        "frames": len(frames),
+        "mode": "interactive",
+        "driver": f"synthetic:{args.demo}" if args.demo else "human",
+    }
+
+
 def cmd_compile(args: argparse.Namespace) -> dict[str, Any]:
     from openadapt_flow.__main__ import main as flow_main
 
@@ -283,6 +360,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--param", action="append", metavar="K=V")
     p.add_argument("--headed", action="store_true")
     p.set_defaults(func=cmd_record_scripted)
+
+    p = sub.add_parser("record-interactive")
+    p.add_argument("--url", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--stop-file", required=True)
+    p.add_argument("--param", action="append", metavar="FIELD")
+    p.add_argument("--secret", action="append", metavar="FIELD")
+    p.add_argument("--demo", default=None, choices=sorted(DEMONSTRATIONS))
+    p.add_argument("--headless", action="store_true")
+    p.set_defaults(func=cmd_record_interactive)
 
     p = sub.add_parser("compile")
     p.add_argument("--recording", required=True)

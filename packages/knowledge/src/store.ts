@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import type {
   Application,
   ExecutionOutcome,
+  Plan,
   ExecutionStepResult,
   ParamSpec,
   RecordingMode,
@@ -842,6 +843,44 @@ export class Store {
       score: Number(Number(row["score"]).toFixed(4)),
       method: "vector" as const,
     }));
+  }
+
+  /* ---------------- plans ---------------- */
+
+  /**
+   * Plans are reviewable artifacts, so they survive an API restart and are
+   * scoped to the tenant that produced them. Expired plans are pruned on read.
+   */
+  async savePlan(plan: Plan, ttlMs = 30 * 60_000): Promise<void> {
+    const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+    await this.sql.query(
+      `INSERT INTO plans (id, tenant_id, intent, skill_id, workflow_id, payload, created_at, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8)
+       ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, expires_at = EXCLUDED.expires_at`,
+      [
+        plan.id,
+        plan.tenantId,
+        plan.intent,
+        plan.skillId,
+        plan.workflowId,
+        JSON.stringify(plan),
+        plan.createdAt,
+        expiresAt,
+      ],
+    );
+    await this.sql.query(
+      "DELETE FROM plans WHERE tenant_id = $1 AND expires_at <= NOW()",
+      [plan.tenantId],
+    );
+  }
+
+  async getPlan(tenantId: string, planId: string): Promise<Plan | null> {
+    const rows = await this.sql.query<{ payload: Plan }>(
+      "SELECT payload FROM plans WHERE tenant_id = $1 AND id = $2 AND expires_at > NOW()",
+      [tenantId, planId],
+    );
+    const row = rows[0];
+    return row ? row.payload : null;
   }
 
   /* ---------------- graph ---------------- */

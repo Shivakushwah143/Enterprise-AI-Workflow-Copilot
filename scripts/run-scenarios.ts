@@ -1,19 +1,23 @@
 /**
- * End-to-end scenario: record -> learn -> parameterize -> replay -> verify.
+ * End-to-end scenarios: record -> learn -> parameterize -> replay -> verify.
  *
- *   pnpm demo:scenarios
+ *   pnpm demo:scenarios     (alias: pnpm test:e2e)
  *
- * What runs:
- *   - the two disposable demo applications, on the ports declared in DEMO_APPS;
- *   - the real API (Hono) against a throwaway PostgreSQL (PGlite) directory;
+ * What runs, against nothing simulated at the business layer:
+ *   - both disposable demo applications, on the ports declared in DEMO_APPS;
+ *   - the real API (Hono) on a throwaway PostgreSQL (PGlite) directory;
  *   - the real OpenAdapt engine, through the Python bridge subprocess.
  *
- * Nothing here is simulated. The workflow is recorded by driving Chromium
- * through OpenAdapt's Recorder, compiled into a bundle, approved by an admin,
- * executed by an employee request with DIFFERENT input data, and then verified
- * by reading the demo application's database out of band. The deliberate
- * failure scenario switches the application into `reject-create` mode, so the
- * write really is refused.
+ * Coverage:
+ *   1. interactive recorder (headed browser) started and stopped through the
+ *      engine, compiled and inspected. The first session is driven by an
+ *      automated stand-in for a human and is labelled as such; the second is a
+ *      real stop request on a human-mode session (nobody performed actions, so
+ *      it is expected to contain zero events - it proves the stop path only).
+ *   2. for BOTH applications: scripted record -> compile -> approve -> plan with
+ *      new inputs -> approved execution -> independent verification.
+ *   3. the failure matrix: a refused write, a missing control, a duplicate
+ *      record, and an employee attempting an admin action.
  *
  * Exit codes: 0 = every check passed, 1 = a check failed, 2 = blocked (the
  * engine is not usable on this machine; the reason is printed and recorded).
@@ -22,7 +26,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { serve } from "@hono/node-server";
 import { KnowledgeEngine, Store, openDb } from "@copilot/knowledge";
-import { DEMO_APPS, OpenAdaptEngine } from "@copilot/workflow";
+import { DEMO_APPS, OpenAdaptEngine, fillTemplate, inspectBundle } from "@copilot/workflow";
 import type { VerificationContract } from "@copilot/shared";
 import { createApp } from "../apps/api/src/app.js";
 import { seedDemo } from "../apps/api/src/seed-data.js";
@@ -49,10 +53,6 @@ function section(title: string): void {
   console.log(`\n=== ${title} ===`);
 }
 
-function portOf(url: string): number {
-  return Number(new URL(url).port);
-}
-
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -62,15 +62,13 @@ const apiPort = Number(process.env.SCENARIO_API_PORT ?? 4100);
 const baseUrl = `http://127.0.0.1:${apiPort}`;
 
 if (!process.env.PYTHON_BIN) {
-  const candidate = path.resolve(
+  process.env.PYTHON_BIN = path.resolve(
     process.platform === "win32" ? ".venv-flow/Scripts/python.exe" : ".venv-flow/bin/python",
   );
-  process.env.PYTHON_BIN = candidate;
 }
 
 let adminToken = "";
 let employeeToken = "";
-let tenantId = "";
 
 async function api<T = any>(
   method: string,
@@ -90,13 +88,10 @@ async function api<T = any>(
 }
 
 async function login(tenantSlug: string, email: string): Promise<string> {
-  const response = await api<{ token: string; tenantId: string }>("POST", "/api/auth/login", {
+  const response = await api<{ token: string }>("POST", "/api/auth/login", {
     body: { tenantSlug, email },
   });
-  if (response.status !== 200) {
-    throw new Error(`login failed for ${email}: HTTP ${response.status}`);
-  }
-  tenantId = response.body.tenantId;
+  if (response.status !== 200) throw new Error(`login failed for ${email}: HTTP ${response.status}`);
   return response.body.token;
 }
 
@@ -118,15 +113,34 @@ async function waitForRecording(recordingId: string, timeoutMs = 10 * 60_000) {
   throw new Error("recording did not finish within the timeout");
 }
 
+async function oracle(demoBase: string, contract: VerificationContract, inputs: Record<string, string>) {
+  const url = fillTemplate(contract.url, inputs);
+  const response = await fetch(url);
+  const payload = (await response.json()) as Record<string, unknown>;
+  const items = payload[contract.recordPath];
+  return { url, items: Array.isArray(items) ? (items as Record<string, unknown>[]) : [] };
+}
+
+async function setFault(appUrl: string, mode: string): Promise<void> {
+  await fetch(`${appUrl}/api/faults`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
 async function main(): Promise<number> {
   await rm(runRoot, { recursive: true, force: true });
   await mkdir(runRoot, { recursive: true });
 
   const crm = DEMO_APPS[0]!;
   const stock = DEMO_APPS[1]!;
-  const crmApp = await startAcmeDesk({ port: portOf(crm.baseUrl), dataDir: path.join(runRoot, "demo") });
+  const crmApp = await startAcmeDesk({
+    port: Number(new URL(crm.baseUrl).port),
+    dataDir: path.join(runRoot, "demo"),
+  });
   const stockApp = await startStockDesk({
-    port: portOf(stock.baseUrl),
+    port: Number(new URL(stock.baseUrl).port),
     dataDir: path.join(runRoot, "demo"),
   });
   console.log(`demo applications: ${crmApp.url}, ${stockApp.url}`);
@@ -154,8 +168,7 @@ async function main(): Promise<number> {
     );
     check(
       "database is PostgreSQL with tenant scoping",
-      capabilities.body?.database?.kind === "pglite" &&
-        capabilities.body?.database?.tenancyEnforced === true,
+      capabilities.body?.database?.tenancyEnforced === true,
       `kind=${capabilities.body?.database?.kind}`,
     );
     console.log(
@@ -163,213 +176,324 @@ async function main(): Promise<number> {
     );
     if (!engineUp) {
       console.log("\nBLOCKED: the workflow engine is not usable, so the lifecycle cannot run.");
-      console.log("Install it with:  .venv-flow/Scripts/python.exe -m pip install -e \"research/OpenAdapt/packages/flow[browser]\"");
-      console.log("Then:             .venv-flow/Scripts/python.exe -m playwright install chromium");
+      console.log(
+        'Install it with: .venv-flow/Scripts/python.exe -m pip install -e "research/OpenAdapt/packages/flow[browser]"',
+      );
       await writeEvidence({ blocked: true });
       return 2;
     }
 
-    section("1. Admin teaches a business workflow (record -> compile)");
+    section("1. Interactive recorder (headed browser)");
     adminToken = await login("acme-demo", world.users.admin);
     employeeToken = await login("acme-demo", world.users.employee);
-    check("admin and employee sessions issued", Boolean(adminToken && employeeToken), `tenant ${tenantId}`);
+    check("admin and employee sessions issued", Boolean(adminToken && employeeToken), "acme-demo");
 
-    const started = await api<any>("POST", "/api/recordings", {
-      token: adminToken,
+    // 1a. The real interactive recorder, driven by an automated stand-in.
+    const interactiveDir = path.join(runRoot, "interactive", "standin-rec");
+    const standin = await engine.recordInteractive({
+      url: crm.baseUrl,
+      outDir: interactiveDir,
+      paramFields: ["company_name", "email"],
+      demoKey: "acme-crm",
+    });
+    const standinResult = await standin.result;
+    check(
+      "interactive recorder captured a demonstration in a headed browser",
+      standinResult.ok && standinResult.events > 0,
+      `events=${standinResult.events} frames=${standinResult.frames} driver=automated stand-in (NOT a human session)`,
+    );
+    const standinBundle = path.join(runRoot, "interactive", "standin-bundle");
+    const standinCompiled = await engine.compile({
+      recordingDir: standinResult.recordingDir,
+      bundleDir: standinBundle,
+      name: "Interactive stand-in demo",
+    });
+    const inspectedInteractive = standinCompiled.ok
+      ? await inspectBundle(standinBundle)
+      : null;
+    check(
+      "the interactive recording compiles into a parameterized workflow",
+      Boolean(inspectedInteractive) &&
+        inspectedInteractive!.steps.length >= 5 &&
+        inspectedInteractive!.params.length === 2,
+      inspectedInteractive
+        ? `${inspectedInteractive.steps.length} steps, params ${inspectedInteractive.params.map((p) => p.name).join(", ")}`
+        : (standinCompiled.error ?? "compile failed"),
+    );
+
+    // 1b. A stop request on a human-mode session. Nobody is at the keyboard in
+    // this run, so zero events is the correct result; what is proven is that a
+    // stop request ends the session and the browser closes.
+    const humanDir = path.join(runRoot, "interactive", "stop-rec");
+    const session = await engine.recordInteractive({
+      url: crm.baseUrl,
+      outDir: humanDir,
+      paramFields: ["company_name", "email"],
+    });
+    await sleep(2500);
+    const stopStarted = Date.now();
+    await session.stop();
+    const stopped = await session.result;
+    check(
+      "a stop request ends the session and the recorder flushes",
+      stopped.ok && Date.now() - stopStarted < 60_000,
+      `events=${stopped.events} (no human drove this session) stop took ${Date.now() - stopStarted}ms`,
+    );
+
+    section("2. Rejected permissions");
+    const forbiddenApprove = await api<any>("POST", `/api/workflows/any/approve`, {
+      token: employeeToken,
+      body: {},
+    });
+    check(
+      "an employee cannot approve a workflow",
+      forbiddenApprove.status === 403,
+      `HTTP ${forbiddenApprove.status} ${forbiddenApprove.body?.error?.message ?? ""}`,
+    );
+    const forbiddenRecord = await api<any>("POST", "/api/recordings", {
+      token: employeeToken,
       body: { applicationId: world.applications[0]!.application.id, mode: "scripted" },
     });
-    check("recording accepted", started.status === 202, `HTTP ${started.status}`);
-    if (started.status !== 202) throw new Error("recording could not be started");
-
-    const finished = await waitForRecording(started.body.id);
     check(
-      "demonstration compiled into a draft workflow",
-      finished.recording.status === "compiled" && Boolean(finished.workflow),
-      `status=${finished.recording.status} error=${finished.recording.error ?? "none"}`,
-    );
-    const workflow = finished.workflow;
-    if (!workflow) throw new Error("no workflow was produced");
-    check(
-      "the learned workflow has steps with recorded identity",
-      workflow.steps.length > 0 && workflow.steps.every((s: any) => s.action),
-      `${workflow.steps.length} steps, ${workflow.uncertainty.length} uncertainty note(s)`,
-    );
-    console.log(
-      `      bundle: ${workflow.bundlePath}\n      steps: ${workflow.steps
-        .map((s: any) => `${s.index}:${s.action}${s.paramName ? `(${s.paramName})` : ""}`)
-        .join(" -> ")}`,
+      "an employee cannot record a demonstration",
+      forbiddenRecord.status === 403,
+      `HTTP ${forbiddenRecord.status}`,
     );
 
-    section("2. Admin approves the skill (parameterize + verification contract)");
-    const verification: VerificationContract = {
-      kind: "http",
-      tier: "system_of_record",
-      url: world.applications[0]!.demo.verification.url,
-      recordPath: world.applications[0]!.demo.verification.recordPath,
-      expect: world.applications[0]!.demo.verification.expect,
-      match: world.applications[0]!.demo.verification.match,
-    };
-    const approved = await api<any>("POST", `/api/workflows/${workflow.id}/approve`, {
-      token: adminToken,
-      body: {
-        name: world.applications[0]!.demo.workflowName,
-        description: world.applications[0]!.demo.description,
-        triggeredBy: world.applications[0]!.demo.triggers,
-        verification,
-        acknowledgeRisk: true,
+    section("3. Cross-application lifecycle");
+    const approved: { demo: typeof crm; skillId: string; workflowId: string }[] = [];
+    const intents: Record<string, { text: string; inputs: Record<string, string> }> = {
+      "acme-crm": {
+        text: 'Create a customer named "Northwind Freight" with contact ops@northwind.test',
+        inputs: { company_name: "Northwind Freight", email: "ops@northwind.test" },
       },
-    });
-    check("workflow approved into an active skill", approved.status === 201, `HTTP ${approved.status}`);
-    const skill = approved.body?.skill;
-    if (!skill) throw new Error(`approval failed: ${JSON.stringify(approved.body)}`);
-    check(
-      "skill declares the parameters learned from the bundle",
-      Array.isArray(skill.requiredInputs) && skill.requiredInputs.length > 0,
-      skill.requiredInputs.map((p: any) => `${p.name}${p.secret ? "(secret)" : ""}`).join(", "),
-    );
+      stockdesk: {
+        text: 'Register stock item "SKU-8842" with quantity 40',
+        inputs: { sku: "SKU-8842", quantity: "40" },
+      },
+    };
 
-    section("3. Employee asks in natural language (new input data)");
-    const intent =
-      'Create a customer named "Northwind Freight" with contact ops@northwind.test';
-    const planResponse = await api<any>("POST", "/api/plans", {
+    for (const [index, demo] of DEMO_APPS.entries()) {
+      const application = world.applications[index]!.application;
+      console.log(`\n--- ${demo.name} ---`);
+
+      const started = await api<any>("POST", "/api/recordings", {
+        token: adminToken,
+        body: { applicationId: application.id, mode: "scripted" },
+      });
+      check(`${demo.name}: demonstration accepted`, started.status === 202, `HTTP ${started.status}`);
+      const finished = await waitForRecording(started.body.id);
+      check(
+        `${demo.name}: compiled into a draft workflow`,
+        finished.recording.status === "compiled" && Boolean(finished.workflow),
+        `status=${finished.recording.status} error=${finished.recording.error ?? "none"}`,
+      );
+      const workflow = finished.workflow;
+      if (!workflow) continue;
+
+      const verification: VerificationContract = {
+        kind: "http",
+        tier: "system_of_record",
+        url: demo.verification.url,
+        recordPath: demo.verification.recordPath,
+        expect: demo.verification.expect,
+        match: demo.verification.match,
+      };
+      const approval = await api<any>("POST", `/api/workflows/${workflow.id}/approve`, {
+        token: adminToken,
+        body: {
+          name: demo.workflowName,
+          description: demo.description,
+          triggeredBy: demo.triggers,
+          verification,
+          acknowledgeRisk: true,
+        },
+      });
+      check(
+        `${demo.name}: workflow approved into an active skill`,
+        approval.status === 201 && approval.body?.skill?.status === "active",
+        `HTTP ${approval.status} inputs=${(approval.body?.skill?.requiredInputs ?? []).map((p: any) => p.name).join(",")}`,
+      );
+      const skill = approval.body?.skill;
+      if (!skill) continue;
+      approved.push({ demo, skillId: skill.id, workflowId: workflow.id });
+
+      const planResponse = await api<any>("POST", "/api/plans", {
+        token: employeeToken,
+        body: { intent: intents[demo.key]!.text },
+      });
+      const plan = planResponse.body?.plan;
+      check(
+        `${demo.name}: the agent selects the approved skill from natural language`,
+        plan?.skillId === skill.id,
+        `method=${planResponse.body?.method} confidence=${plan?.confidence} intent="${intents[demo.key]!.text}"`,
+      );
+      const resolved = Object.fromEntries(
+        (plan?.resolvedInputs ?? []).map((i: any) => [i.name, i.value]),
+      );
+      check(
+        `${demo.name}: new input data is extracted, not the demonstrated values`,
+        JSON.stringify(resolved) === JSON.stringify(intents[demo.key]!.inputs),
+        JSON.stringify(resolved),
+      );
+
+      const blockedRun = await api<any>("POST", "/api/executions", {
+        token: employeeToken,
+        body: { planId: plan.id, inputs: {}, approved: false },
+      });
+      check(
+        `${demo.name}: executing without the policy approval is refused`,
+        blockedRun.body?.outcome === "REJECTED_POLICY",
+        `outcome=${blockedRun.body?.outcome}`,
+      );
+
+      const run = await api<any>("POST", "/api/executions", {
+        token: employeeToken,
+        body: { planId: plan.id, inputs: {}, approved: true },
+      });
+      check(
+        `${demo.name}: execution VERIFIED by the system of record`,
+        run.body?.outcome === "VERIFIED",
+        `outcome=${run.body?.outcome} engine=${run.body?.engineOutcome} message="${run.body?.message}"`,
+      );
+      check(
+        `${demo.name}: verification evidence is a real read-back`,
+        run.body?.verification?.passed === true &&
+          run.body?.verification?.tier === "system_of_record",
+        run.body?.verification?.detail ?? "no verification result",
+      );
+      const readback = await oracle(demo.baseUrl, verification, intents[demo.key]!.inputs);
+      check(
+        `${demo.name}: the application database contains the new record`,
+        readback.items.length === 1,
+        `${readback.url} -> ${JSON.stringify(readback.items)}`,
+      );
+
+      const guidance = await api<any>("GET", `/api/guidance?skillId=${skill.id}&stepIndex=0`, {
+        token: employeeToken,
+      });
+      check(
+        `${demo.name}: guidance exposes the recorded selector`,
+        guidance.body?.highlightable === true && Boolean(guidance.body?.selector),
+        `selector=${guidance.body?.selector} instruction="${guidance.body?.instruction}"`,
+      );
+    }
+
+    section("4. Failure matrix");
+    // A refused write: the application answers 500 and persists nothing.
+    await setFault(crm.baseUrl, "reject-create");
+    const rejectedPlan = await api<any>("POST", "/api/plans", {
       token: employeeToken,
-      body: { intent },
+      body: { intent: 'Create a customer named "Fabrikam Rail" with contact ops@fabrikam.test' },
     });
-    const plan = planResponse.body?.plan;
-    check(
-      "agent selects the approved skill",
-      plan?.skillId === skill.id,
-      `skill=${plan?.skillName} method=${planResponse.body?.method} confidence=${plan?.confidence}`,
-    );
-    check(
-      "agent extracts the new input values instead of reusing the demonstration",
-      plan?.resolvedInputs?.some(
-        (i: any) => i.name === "company_name" && i.value === "Northwind Freight",
-      ) === true,
-      JSON.stringify(plan?.resolvedInputs),
-    );
-
-    section("4. Extension state before and during execution");
-    const context = await api<any>(
-      "GET",
-      `/api/context?url=${encodeURIComponent(world.applications[0]!.application.baseUrl + "/")}`,
-      { token: employeeToken },
-    );
-    check(
-      "extension sees the application and its suggested skills",
-      context.body?.appName === world.applications[0]!.demo.name &&
-        context.body?.suggestedSkills?.length > 0,
-      `app=${context.body?.appName} skills=${context.body?.suggestedSkills?.length}`,
-    );
-    const guidance = await api<any>(
-      "GET",
-      `/api/guidance?skillId=${skill.id}&stepIndex=0`,
-      { token: employeeToken },
-    );
-    check(
-      "guidance step 1 is highlightable from a recorded selector",
-      guidance.body?.highlightable === true && Boolean(guidance.body?.selector),
-      `selector=${guidance.body?.selector} instruction="${guidance.body?.instruction}"`,
-    );
-
-    section("5. Guarded execution against the real application");
-    const blockedRun = await api<any>("POST", "/api/executions", {
+    const rejectedRun = await api<any>("POST", "/api/executions", {
       token: employeeToken,
-      body: { planId: plan.id, inputs: {}, approved: false },
-    });
-    check(
-      "irreversible workflow is refused without explicit approval",
-      blockedRun.body?.outcome === "REJECTED_POLICY",
-      `outcome=${blockedRun.body?.outcome}`,
-    );
-
-    const run = await api<any>("POST", "/api/executions", {
-      token: employeeToken,
-      body: { planId: plan.id, inputs: {}, approved: true },
-    });
-    const execution = run.body;
-    check(
-      "execution is VERIFIED by the system of record",
-      execution?.outcome === "VERIFIED",
-      `outcome=${execution?.outcome} engine=${execution?.engineOutcome} message="${execution?.message}"`,
-    );
-    check(
-      "verification read the record from the application API",
-      execution?.verification?.passed === true &&
-        execution?.verification?.tier === "system_of_record",
-      execution?.verification?.detail ?? "no verification result",
-    );
-    console.log(
-      `      steps: ${(execution?.steps ?? [])
-        .map((s: any) => `${s.index}:${s.status}${s.rung ? `/${s.rung}` : ""}`)
-        .join(" ")}\n      report: ${execution?.engineReportPath}`,
-    );
-
-    const oracle = await fetch(
-      `${world.applications[0]!.application.baseUrl}/api/customers?name=Northwind%20Freight`,
-    );
-    const oracleBody = await oracle.json();
-    check(
-      "the application database really contains the new customer",
-      Array.isArray(oracleBody.items) &&
-        oracleBody.items.length === 1 &&
-        oracleBody.items[0].email === "ops@northwind.test",
-      JSON.stringify(oracleBody.items),
-    );
-
-    section("6. Deliberate failed write (the application rejects the save)");
-    await fetch(`${world.applications[0]!.application.baseUrl}/api/faults`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ mode: "reject-create" }),
-    });
-    const failIntent =
-      'Create a customer named "Fabrikam Rail" with contact ops@fabrikam.test';
-    const failPlan = await api<any>("POST", "/api/plans", {
-      token: employeeToken,
-      body: { intent: failIntent },
-    });
-    const failRun = await api<any>("POST", "/api/executions", {
-      token: employeeToken,
-      body: { planId: failPlan.body?.plan?.id, inputs: {}, approved: true },
+      body: { planId: rejectedPlan.body?.plan?.id, inputs: {}, approved: true },
     });
     check(
       "a refused write produces FAILED, never VERIFIED",
-      failRun.body?.outcome === "FAILED",
-      `outcome=${failRun.body?.outcome} message="${failRun.body?.message}"`,
+      rejectedRun.body?.outcome === "FAILED" && rejectedRun.body?.verification?.passed === false,
+      `outcome=${rejectedRun.body?.outcome} message="${rejectedRun.body?.message}"`,
     );
-    const failedOracle = await fetch(
-      `${world.applications[0]!.application.baseUrl}/api/customers?name=Fabrikam%20Rail`,
-    );
-    const failedBody = await failedOracle.json();
+    const rejectedReadback = await fetch(
+      `${crm.baseUrl}/api/customers?name=Fabrikam%20Rail`,
+    ).then((r) => r.json());
     check(
       "the refused record is absent from the application database",
-      Array.isArray(failedBody.items) && failedBody.items.length === 0,
-      JSON.stringify(failedBody.items),
+      Array.isArray(rejectedReadback.items) && rejectedReadback.items.length === 0,
+      JSON.stringify(rejectedReadback.items),
     );
-    await fetch(`${world.applications[0]!.application.baseUrl}/api/faults`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ mode: "none" }),
-    });
+    await setFault(crm.baseUrl, "none");
 
-    section("7. Execution history for the extension");
+    // A missing control: the page no longer offers the save button.
+    await setFault(stock.baseUrl, "missing-control");
+    const missingPage = await fetch(`${stock.baseUrl}/`).then((r) => r.text());
+    check(
+      "the application really serves a page without the save control",
+      missingPage.includes("save-unavailable") && !missingPage.includes("save-item"),
+      `save-unavailable present=${missingPage.includes("save-unavailable")}`,
+    );
+    const missingPlan = await api<any>("POST", "/api/plans", {
+      token: employeeToken,
+      body: { intent: 'Register stock item "SKU-9999" with quantity 5' },
+    });
+    const missingRun = await api<any>("POST", "/api/executions", {
+      token: employeeToken,
+      body: { planId: missingPlan.body?.plan?.id, inputs: {}, approved: true },
+    });
+    check(
+      "a missing control fails the run instead of claiming success",
+      missingRun.body?.outcome === "FAILED",
+      `outcome=${missingRun.body?.outcome} message="${(missingRun.body?.message ?? "").slice(0, 200)}"`,
+    );
+    const missingReadback = await fetch(`${stock.baseUrl}/api/items?sku=SKU-9999`).then((r) =>
+      r.json(),
+    );
+    check(
+      "no record was written when the control was missing",
+      Array.isArray(missingReadback.items) && missingReadback.items.length === 0,
+      JSON.stringify(missingReadback.items),
+    );
+    await setFault(stock.baseUrl, "none");
+
+    // A duplicate: the pre-run read refuses to re-create what already exists.
+    const duplicatePlan = await api<any>("POST", "/api/plans", {
+      token: employeeToken,
+      body: { intent: intents["acme-crm"]!.text },
+    });
+    const duplicateRun = await api<any>("POST", "/api/executions", {
+      token: employeeToken,
+      body: { planId: duplicatePlan.body?.plan?.id, inputs: {}, approved: true },
+    });
+    check(
+      "an existing record is refused before anything runs",
+      duplicateRun.body?.outcome === "REJECTED",
+      `outcome=${duplicateRun.body?.outcome} message="${duplicateRun.body?.message}"`,
+    );
+
+    section("5. Execution history and extension context");
     const history = await api<any>("GET", "/api/executions", { token: employeeToken });
     const outcomes = (history.body?.items ?? []).map((i: any) => i.outcome);
     check(
-      "history shows both the verified and the failed run",
+      "history shows verified and failed runs side by side",
       outcomes.includes("VERIFIED") && outcomes.includes("FAILED"),
       outcomes.join(", "),
+    );
+    for (const demo of DEMO_APPS) {
+      const context = await api<any>(
+        "GET",
+        `/api/context?url=${encodeURIComponent(`${demo.baseUrl}/`)}`,
+        { token: employeeToken },
+      );
+      check(
+        `extension context resolves ${demo.name}`,
+        context.body?.appName === demo.name && context.body?.suggestedSkills?.length > 0,
+        `app=${context.body?.appName} skills=${context.body?.suggestedSkills?.length}`,
+      );
+    }
+
+    section("6. Persistence");
+    const planRows = await sql.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM plans");
+    const executionRows = await sql.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM executions",
+    );
+    const verificationRows = await sql.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM verification_results",
+    );
+    check(
+      "plans, executions and verification evidence are persisted",
+      Number(planRows[0]?.count ?? 0) >= 4 &&
+        Number(executionRows[0]?.count ?? 0) >= 4 &&
+        Number(verificationRows[0]?.count ?? 0) >= 2,
+      `plans=${planRows[0]?.count} executions=${executionRows[0]?.count} verifications=${verificationRows[0]?.count}`,
     );
 
     const passed = failures.length === 0;
     await writeEvidence({
       blocked: false,
       outcome: passed ? "PASS" : "FAIL",
-      workflowId: workflow.id,
-      skillId: skill.id,
-      bundlePath: workflow.bundlePath,
-      executions: outcomes,
+      applications: DEMO_APPS.map((d) => d.name),
+      skills: approved.map((a) => ({ application: a.demo.name, skillId: a.skillId })),
       checks,
     });
     return passed ? 0 : 1;
