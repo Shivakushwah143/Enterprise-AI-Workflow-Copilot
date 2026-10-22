@@ -12,5 +12,5 @@
       "@copilot/shared": ["../../packages/shared/src/index.ts"]
     }
   },
-  "include": ["entrypoints/**/*", "wxt.config.ts", ".wxt/**/*"]
+  "include": ["entrypoints/**/*", "wxt.config.ts", "env.d.ts", ".wxt/**/*"]
 }

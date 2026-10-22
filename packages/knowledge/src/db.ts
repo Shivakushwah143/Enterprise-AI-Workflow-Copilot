@@ -9,7 +9,7 @@
  *
  * Both use `$n` placeholders, so every query below is portable.
  */
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -31,12 +31,23 @@ async function loadSchema(): Promise<string> {
   return readFile(SCHEMA_PATH, "utf8");
 }
 
-/** Split on semicolons that are not inside a string literal or a $$ block. */
+/**
+ * Split on statement boundaries, then drop comment lines.
+ *
+ * The leading comment block belongs to the first statement, so filtering whole
+ * chunks that *start* with `--` would silently drop the first CREATE TABLE.
+ */
 function splitStatements(sql: string): string[] {
   return sql
     .split(/;\s*\n/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0 && !s.startsWith("--"));
+    .map((chunk) =>
+      chunk
+        .split(/\r?\n/)
+        .filter((line) => !line.trim().startsWith("--"))
+        .join("\n")
+        .trim(),
+    )
+    .filter((s) => s.length > 0);
 }
 
 class PostgresSql implements Sql {
@@ -124,6 +135,9 @@ export async function openDb(options: OpenDbOptions = {}): Promise<Sql> {
       options.dataDir ??
       process.env.COPILOT_DB_DIR ??
       path.resolve(".copilot-data", "pg");
+    // PGlite creates its own directory but not the parent, so make the path
+    // first: a fresh checkout has no `.copilot-data` yet.
+    await mkdir(dataDir, { recursive: true });
     sql = new PgliteSql(new PGlite(dataDir));
   }
 

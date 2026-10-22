@@ -23,9 +23,16 @@
     "db:down": "docker compose down"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "spawn-sync"]
+    "onlyBuiltDependencies": ["esbuild", "spawn-sync"],
+    "overrides": {
+      "@vitejs/plugin-react": "^4.4.1"
+    }
   },
   "devDependencies": {
+    "@copilot/agent": "workspace:*",
+    "@copilot/knowledge": "workspace:*",
+    "@copilot/shared": "workspace:*",
+    "@copilot/workflow": "workspace:*",
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
